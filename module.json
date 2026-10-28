@@ -2,7 +2,7 @@
   "id": "dnd-friends-character-importer",
   "title": "D&D Friends Character Importer",
   "description": "Import Discord character-bot exports into Foundry VTT dnd5e 5.x (new characters or level-ups of existing ones), and export characters to Roll20.",
-  "version": "0.20.0",
+  "version": "0.20.2",
   "authors": [
     {
       "name": "ESONJ"
@@ -10,7 +10,7 @@
   ],
   "url": "https://github.com/Zeph10/dnd-friends-importer",
   "manifest": "https://github.com/Zeph10/dnd-friends-importer/releases/latest/download/module.json",
-  "download": "https://github.com/Zeph10/dnd-friends-importer/releases/download/v0.20.0/module.zip",
+  "download": "https://github.com/Zeph10/dnd-friends-importer/releases/download/v0.20.2/module.zip",
   "bugs": "https://github.com/Zeph10/dnd-friends-importer/issues",
   "compatibility": {
     "minimum": "14",

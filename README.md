@@ -1,4 +1,4 @@
-# D&D Friends Character Importer v0.20.0
+# D&D Friends Character Importer v0.20.2
 
 ## Install
 
@@ -269,3 +269,6 @@ Export to Roll20 from Foundry
 - It runs the Foundry → Roll20 Converter's own Python code (converter 1.4.0, bundled as `scripts/roll20-converter.js`) in the browser with Pyodide, so the output is identical to the website's. You can pick the spellcasting ability and which temporary effects to bake in, see the converter's warnings, and download the JSON and the conversion report.
 - The Python runtime (Pyodide 0.27.7, about 10 MB) downloads from jsDelivr the first time in a session. A world setting, **Python runtime URL**, can point it elsewhere.
 - To ship a newer converter, run `python3 tools/build_converter_js.py path/to/converter.py scripts/roll20-converter.js`.
+
+## v0.20.2
+- Fixes other modules' compendium searches breaking after the importer runs (for example Guild Abilities reporting spells as "not found", or the error "Cannot create property 'rules' on number" on sidebar renders). Since 0.19.13 the importer asked every compendium's index for nested fields such as `system.source.rules`. Foundry remembers requested index fields for the whole session, and dnd5e already indexes `system.source` whole, so any entry whose source is not an object made every later index read of that compendium fail. The importer now asks for fields in the same shape dnd5e uses (`system.source` whole), and only from Item compendiums; actor, journal and scene compendiums keep Foundry's default index. **Reload the world (F5) once after updating** to clear fields Foundry cached in the old session.
