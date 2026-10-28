@@ -114,7 +114,12 @@ function averageHp(data, order=defaultClassOrder(data), overrideCon=null, dice={
   return Math.max(1,hp);
 }
 
-const INDEX_FIELDS=["name","type","system.advancement","system.source.rules","system.source.book","system.identifier","system.level","system.type.value","system.type.subtype","system.type.baseItem","system.mastery","system.requirements","system.classIdentifier","flags.plutonium.spellClassNames","flags.plutonium.page","flags.plutonium.source","flags.plutonium.hash"];
+// Extra compendium index fields for Item packs. Foundry remembers every field ever requested from a pack for the rest of
+// the session and re-applies all of them on later index reads, including other modules' and the sidebar's. A nested
+// request below a property that another request returns whole throws for any entry where that property is not an
+// object (dnd5e indexes "system.source" whole, so "system.source.rules" breaks on an entry whose source is a number).
+// Fields therefore use exactly the shape dnd5e itself uses: "system.source" whole, "system.type.*" nested.
+const INDEX_FIELDS=["system.advancement","system.source","system.identifier","system.level","system.type.value","system.type.subtype","system.type.baseItem","system.mastery","system.requirements","system.classIdentifier","flags.plutonium.spellClassNames","flags.plutonium.page","flags.plutonium.source","flags.plutonium.hash"];
 class ContentResolver {
   constructor(){ this.entries=[]; this.excludedEntries=[]; this.packDiscoveries=[]; this.loaded=false; this.enabledPlutoniumSources=null; }
   /** One shared load per session; `force` re-reads everything (the "Refresh content" button). */
@@ -147,9 +152,12 @@ class ContentResolver {
       // The index (a handful of fields per entry) is enough for matching and is far faster than
       // pack.getDocuments(), which loads every document of every compendium. Full documents are only
       // read for a pack whose index cannot be read.
+      // Only Item packs get extra fields; other packs (actors, journals, scenes…) are read with Foundry's default index.
+      const itemPack=ctx.packDocumentName==="Item";
       let docs=null;
-      try { docs=[...(await pack.getIndex({fields:INDEX_FIELDS}))]; }
+      try { docs=[...(await (itemPack?pack.getIndex({fields:INDEX_FIELDS}):pack.getIndex()))]; }
       catch(indexErr){
+        if(!itemPack){ console.warn(`${MODULE_ID} could not read the index of ${pack.collection}`,indexErr); return; }
         try { docs=await pack.getDocuments(); }
         catch(fullErr){ console.warn(`${MODULE_ID} could not read ${pack.collection}`,{indexErr,fullErr}); return; }
       }
