@@ -1,16 +1,34 @@
-# D&D Friends Character Importer v0.18.1
+# D&D Friends Character Importer v0.19.10
 
 ## Install
 
 In Foundry VTT: **Setup → Add-on Modules → Install Module**, then paste this into **Manifest URL**:
 
 ```
-https://github.com/Zeph10/dnd-friends-character-importer/releases/latest/download/module.json
+https://github.com/Zeph10/dnd-friends-importer/releases/latest/download/module.json
 ```
 
-Requires Foundry VTT 14 and the dnd5e system 5.x. Maintainers: see [RELEASING.md](RELEASING.md).
+Requires Foundry VTT 14 and the dnd5e system 5.x.
 
 Foundry VTT 14 / dnd5e 5.x character importer for the Discord character-bot export format.
+
+## v0.19.9
+
+- Fighting Style choices now expose the full standard list even when Foundry/DDB only provides a partial advancement pool.
+- Fighting Style resolution now searches both 2024 and legacy-metadata compendium feats by exact name, then raw Plutonium/UA feat data, before falling back to a clearly marked native feat.
+- Improved Fighting Style help text.
+
+## v0.19.8
+- Fighting Style choices now merge the class advancement's own pool, indexed Fighting Style feats, and enabled raw 5etools/UA Fighting Style feats instead of depending only on the global Foundry index.
+- Relative/module-specific Fighting Style UUIDs are resolved against their owning class document, fixing styles that were visible in the class advancement but absent from the global index.
+- Added clearer inline instructions and hover/focus help for advancement choices.
+- Renamed the placement control from “Show under …” to “Group under …” and explains that it only controls sheet organization, not rules.
+
+## v0.19.6
+- Fixes UA/prerelease classes, subclasses, feats, and other Plutonium documents being dropped when Plutonium stamped them with legacy/2014 rules metadata. UA source identity now takes precedence over inconsistent rules metadata.
+- UA material remains controlled by the per-import source filter, so it is only eligible when its source is enabled.
+- Missing class/subclass diagnostics now distinguish disabled sources, rules-metadata exclusions, and content that is not indexed at all.
+
 
 ## v0.4 fixes
 - Resolves Plutonium relative advancement UUIDs (such as `.pJdME4q946V9OaCi`) against the source actor, allowing actor-owned Plutonium subclasses such as Circle of the Titan to grant their subclass features.
@@ -162,10 +180,17 @@ Workflow
 - Remote Unearthed Arcana loading from GitHub is now an opt-in world setting (off by default) and is cached for the session.
 - `game.modules.get("dnd-friends-character-importer").api.diagnostics()` is now async.
 
-## v0.18.1
+
+### v0.19.6
+- Compendium scanning now reads full Item documents, fixing UA/subclass entries that are visible in Foundry but absent from a pack index.
+- Content index refreshes whenever the importer opens.
+
+## v0.19.10
 - Fixes "Could not read export: (data.Feats || []) is not iterable". Exports that store `Feats` as an object keyed by feat name (with per-feat `Stat Bonuses`) now load, as do lists of names. Missing or null sections are treated as empty.
 - Feat Stat Bonuses (for example Tadpole Host +1 INT) are added to the base ability scores, because feat ASI advancements are not re-applied. The Core step lists them and has an opt-out, "The exported scores already include these".
 - Magic-item Stat Bonuses of type `BONUS` are now counted (previously only `MAX` and `FIXED`). `FIXED` (Belt of Giant Strength) no longer lowers a higher score.
 - Species with a lineage suffix, such as "Dragonborn (Blue)", match the base species. The lineage pre-selects a matching species choice (for example a Blue Draconic Ancestry) when one exists.
 - Psion (Unearthed Arcana) defaults to a full Intelligence caster when its class document does not say otherwise.
 - Magic item names are trimmed ("Byeshk Greatsword ").
+- An export with an empty Class section is rejected with a clear message.
+- module.json now has `url`, `manifest` and `download` links to github.com/Zeph10/dnd-friends-importer, so Foundry can install and update the module from GitHub.
