@@ -55,3 +55,31 @@
 
 .cbi .choice-instructions{margin:.1rem 0 .65rem;padding:.5rem .65rem;border-left:3px solid rgba(212,164,60,.7);background:rgba(212,164,60,.07);opacity:.88;font-size:.92em;line-height:1.35}.cbi .choice-help{display:inline-flex;align-items:center;justify-content:center;margin-left:.25rem;opacity:.72;cursor:help;font-size:.82em}.cbi .choice-help:hover,.cbi .choice-help:focus{opacity:1;outline:none}.cbi .adv-choice{margin-bottom:1rem}.cbi .adv-choice h4 small{opacity:.72;font-weight:500}
 .cbi .inline-check{display:inline-flex;gap:.35rem;align-items:center;margin-left:.4rem}
+
+/* v0.19.13 quick-import overview */
+.cbi .overview{margin-top:18px;padding:14px 16px;border:1px solid rgba(212,164,60,.45);border-radius:7px;background:rgba(212,164,60,.05)}
+.cbi .overview h3{margin:0 0 .6rem}.cbi .overview h4{margin:.9rem 0 .35rem;font-size:.95em;opacity:.85}
+.cbi .ov-list{list-style:none;margin:0;padding:0;display:grid;gap:4px}
+.cbi .ov-list li{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:5px 8px;border-radius:4px;border-left:3px solid transparent}
+.cbi .ov-list li.ov-block{border-left-color:#e0795f;background:rgba(224,121,95,.1);font-weight:600}
+.cbi .ov-list li.ov-warn{border-left-color:#c88a42;background:rgba(200,138,66,.08)}
+.cbi .ov-list li.ov-ok{border-left-color:rgba(120,170,110,.6);opacity:.85}
+.cbi .ov-list .link-button{margin:0;white-space:nowrap;font-size:.9em}
+.cbi .ov-warn-list{max-height:260px;overflow:auto}
+.cbi .ov-done{margin-top:.8rem}.cbi .ov-done summary{cursor:pointer;opacity:.8}.cbi .ov-done .ov-list{margin-top:.4rem}
+.cbi .ov-actions{display:flex;gap:8px;margin-top:1rem}.cbi .ov-actions button{width:auto;padding:0 14px}.cbi .ov-actions .create{flex:1}
+.cbi .nav-left{display:flex;gap:6px}.cbi .nav-left button{width:auto}
+.cbi .ov-skills{margin:.5rem 0 .2rem}.cbi .ov-skills .skill-grid{margin-top:.3rem;font-size:.92em}
+.cbi .drop.compact{min-height:0;flex-direction:row;padding:10px;gap:10px}.cbi .drop.compact i{font-size:22px}
+
+/* v0.20 update mode, diagnostics, remembered matches, Roll20 export */
+.cbi .upload-links{display:flex;gap:14px}
+.cbi .ov-target{display:flex;flex-wrap:wrap;align-items:center;gap:6px 14px;margin:0 0 .8rem;padding-bottom:.7rem;border-bottom:1px solid rgba(255,255,255,.12)}
+.cbi .ov-target>label{display:flex;align-items:center;gap:8px;font-weight:600}.cbi .ov-target select{width:auto;min-width:240px}
+.cbi .ov-target p{flex-basis:100%;margin:0}
+.cbi-memory .memory-table{width:100%;border-collapse:collapse}.cbi-memory .memory-table th,.cbi-memory .memory-table td{text-align:left;padding:5px 6px;border-bottom:1px solid rgba(150,150,150,.25)}
+.cbi-memory .memory-table button{width:auto;min-height:26px}
+.cbi-roll20 .r20-row{margin-top:14px;grid-template-columns:auto 220px;justify-content:start}.cbi-roll20 .r20-effect{display:block;margin:3px 0}
+.cbi-roll20 .r20-report{max-height:260px;overflow:auto;white-space:pre-wrap;font-size:.85em}
+.cbi-roll20 .cbi-busy-line{margin-top:1rem;font-weight:600}.cbi-roll20 .cbi-busy-line.error{color:#e0795f}
+.cbi-roll20 .cbi-nav{grid-template-columns:auto 1fr auto}
