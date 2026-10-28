@@ -6,7 +6,7 @@ const SKILLS = {
   ins:"Insight", itm:"Intimidation", inv:"Investigation", med:"Medicine", nat:"Nature", prc:"Perception",
   prf:"Performance", per:"Persuasion", rel:"Religion", slt:"Sleight of Hand", ste:"Stealth", sur:"Survival"
 };
-const HIT_DIE = {barbarian:12, fighter:10, paladin:10, ranger:10, artificer:8, bard:8, cleric:8, druid:8, monk:8, rogue:8, warlock:8, sorcerer:6, wizard:6};
+const HIT_DIE = {barbarian:12, fighter:10, paladin:10, ranger:10, artificer:8, bard:8, cleric:8, druid:8, monk:8, rogue:8, warlock:8, sorcerer:6, wizard:6, psion:6};
 const DAMAGE_TYPES=["acid","bludgeoning","cold","fire","force","lightning","necrotic","piercing","poison","psychic","radiant","slashing","thunder"];
 const CONDITION_TYPES=["blinded","charmed","deafened","frightened","grappled","incapacitated","invisible","paralyzed","petrified","poisoned","prone","restrained","stunned","unconscious"];
 const SENSE_TYPES=["darkvision","blindsight","tremorsense","truesight"];
@@ -106,18 +106,25 @@ function effectiveStats(data, include=()=>true){
 }
 
 function defaultClassOrder(data){ return Object.entries(data.Class||{}).flatMap(([name,c]) => Array(Number(c.Level||0)).fill(name)); }
-function averageHp(data, order=defaultClassOrder(data), overrideCon=null){
+function averageHp(data, order=defaultClassOrder(data), overrideCon=null, dice={}){
   const stats=effectiveStats(data); const con=overrideCon ?? stats.con; const mod=Math.floor((con-10)/2);
-  let hp=0; order.forEach((cls,idx)=>{ const die=HIT_DIE[norm(cls)]||8; hp += (idx===0 ? die : Math.floor(die/2)+1) + mod; });
+  let hp=0; order.forEach((cls,idx)=>{ const die=dice[norm(cls)]||HIT_DIE[norm(cls)]||8; hp += (idx===0 ? die : Math.floor(die/2)+1) + mod; });
   // The server export includes Tough as a feat, but not its HP contribution in Stats.
   if(uniqueFeatNames(data).some(x=>norm(x)==="tough")) hp += 2*Number(data.Level||order.length||0);
   return Math.max(1,hp);
 }
 
+const INDEX_FIELDS=["name","type","system.advancement","system.source.rules","system.source.book","system.identifier","system.level","system.type.value","system.type.subtype","system.type.baseItem","system.mastery","system.requirements","system.classIdentifier","flags.plutonium.spellClassNames","flags.plutonium.page","flags.plutonium.source","flags.plutonium.hash"];
 class ContentResolver {
   constructor(){ this.entries=[]; this.excludedEntries=[]; this.packDiscoveries=[]; this.loaded=false; this.enabledPlutoniumSources=null; }
+  /** One shared load per session; `force` re-reads everything (the "Refresh content" button). */
   async load(force=false){
     if(this.loaded&&!force) return;
+    if(this._loading&&!force) return this._loading;
+    this._loading=this._load(force).finally(()=>{ this._loading=null; });
+    return this._loading;
+  }
+  async _load(force=false){
     if(force){this.entries=[];this.excludedEntries=[];this.packDiscoveries=[];this.loaded=false;}
     const add=(d,uuid,ctx={})=>{ const e=this.entry(d,uuid,ctx); (this.is2024(d,e)?this.entries:this.excludedEntries).push(e); return e; };
     for(const item of game.items) add(item,item.uuid,{location:"World Items"});
@@ -127,7 +134,9 @@ class ContentResolver {
     // Scan every compendium, not just packs whose metadata advertises documentName === "Item".
     // DDB Importer and some other modules can organize imported subclasses in packs/folders whose
     // metadata is inconsistent even though the contained documents are usable Item documents.
-    for(const pack of game.packs){
+    const packs=[...game.packs].filter(p=>p.visible!==false);  // players cannot read packs hidden from them
+    this.packCount=packs.length;
+    const readPack=async pack=>{
       const ctx={
         packCollection:pack.collection||pack.metadata?.id||"",
         packTitle:pack.title||pack.metadata?.label||pack.metadata?.name||pack.collection||"",
@@ -135,13 +144,14 @@ class ContentResolver {
         packDocumentName:pack.documentName||pack.metadata?.type||"",
         location:`Compendium: ${pack.title||pack.metadata?.label||pack.collection||"Unknown"}`
       };
+      // The index (a handful of fields per entry) is enough for matching and is far faster than
+      // pack.getDocuments(), which loads every document of every compendium. Full documents are only
+      // read for a pack whose index cannot be read.
       let docs=null;
-      try { docs=await pack.getDocuments(); }
-      catch(fullErr){
-        try {
-          const idx=await pack.getIndex({fields:["name","type","system.source.rules","system.source.book","system.identifier","system.level","system.type.value","system.type.subtype","system.type.baseItem","system.mastery","system.requirements","system.classIdentifier","flags.plutonium.spellClassNames","flags.plutonium.page","flags.plutonium.source","flags.plutonium.hash"]});
-          docs=[...idx];
-        } catch(indexErr){ console.warn(`${MODULE_ID} could not read ${pack.collection}`,{fullErr,indexErr}); continue; }
+      try { docs=[...(await pack.getIndex({fields:INDEX_FIELDS}))]; }
+      catch(indexErr){
+        try { docs=await pack.getDocuments(); }
+        catch(fullErr){ console.warn(`${MODULE_ID} could not read ${pack.collection}`,{indexErr,fullErr}); return; }
       }
       for(const d of docs||[]){
         const uuid=d.uuid||`Compendium.${pack.collection}.${d.id||d._id}`;
@@ -154,7 +164,8 @@ class ContentResolver {
         const itemLike = docName==="Item" || ctx.packDocumentName==="Item" || ["class","subclass","feat","spell","race","species","equipment","weapon","consumable","tool","loot","container","backpack"].includes(rawType);
         if(itemLike) add(d,uuid,ctx);
       }
-    }
+    };
+    for(let i=0;i<packs.length;i+=8) await Promise.all(packs.slice(i,i+8).map(p=>readPack(p).catch(e=>console.warn(`${MODULE_ID} could not index ${p.collection}`,e))));
     this.loaded=true;
   }
   inferType(d,ctx={}){
@@ -164,7 +175,18 @@ class ContentResolver {
     // DDB Importer compendiums are often explicitly named/foldered "Subclasses". If an entry in
     // such a pack is stored as class/feat because of importer-version metadata differences, treat
     // it as a subclass for matching while preserving rawType for diagnostics.
-    if(/\bsubclasses?\b/.test(context) && ["class","feat","subclass"].includes(raw)) return "subclass";
+    if(/\bsubclasses?\b/.test(context) && ["class","feat","subclass"].includes(raw)){
+      const sys=d.system||{};
+      // A document that names a parent class is a subclass wherever it is stored.
+      if(sys.classIdentifier) return "subclass";
+      // A real class stays a class even inside a pack named "Subclasses" (for example a UA Psion kept in
+      // "DDB Subclasses"). Hit die and levels are model defaults on every class-type document, so only a
+      // HitPoints advancement, which subclasses never have, marks a genuine class. bestClass() also falls
+      // back to an exact-name match on raw type "class" for anything this misses.
+      const adv=sys.advancement?(Array.isArray(sys.advancement)?sys.advancement:Object.values(sys.advancement)):[];
+      if(raw==="class" && adv.some(a=>a?.type==="HitPoints")) return "class";
+      return "subclass";
+    }
     return raw;
   }
   entry(d,uuid,ctx={}){
@@ -182,7 +204,7 @@ class ContentResolver {
     if(ps) return true;
     // Imported custom/UA subclass packs may omit all source metadata. If the pack itself identifies
     // the content as subclasses, keep it available; source filtering still applies when a source exists.
-    if(e && e.type==="subclass" && /\bsubclasses?\b/.test(norm(`${e.packTitle} ${e.packFolder}`))) return true;
+    if(e && ["subclass","class"].includes(e.type) && /\bsubclasses?\b/.test(norm(`${e.packTitle} ${e.packFolder}`))) return true;
     return false;
   }
   diagnostic(name,types=[]){
@@ -219,6 +241,24 @@ class ContentResolver {
     const AS=new Set(A),BS=new Set(B); const inter=[...AS].filter(x=>BS.has(x)).length; const union=new Set([...AS,...BS]).size; return union?inter/union:0;
   }
   best(name,types=[]){ return this.candidates(name,types)[0]||null; }
+  /**
+   * Item matches including content the 2024 filter excluded. Most magic items (Xanathar's, Eberron, 2014 DMG)
+   * were never reprinted, so equipment may come from 2014 sources; a 2024 version wins when both exist.
+   */
+  itemCandidates(name,types=[]){
+    const n=norm(name);
+    const rows=[...this.entries.filter(e=>this.allowed(e)).map(e=>({...e,legacy:false})),...this.excludedEntries.map(e=>({...e,legacy:true}))]
+      .filter(e=>!types.length||types.includes(e.type)).map(e=>({...e,score:this.score(n,norm(e.name),e.type)})).filter(e=>e.score>=0.52)
+      .sort((a,b)=>(b.score-a.score)||((a.legacy?1:0)-(b.legacy?1:0))||(this.priority(b)-this.priority(a)));
+    const out=[],seen=new Set(); for(const e of rows){ const k=`${e.type}:${norm(e.name)}`; if(seen.has(k)) continue; seen.add(k); out.push(e); if(out.length>=8) break; }
+    return out;
+  }
+  /** Class match; if none, an exact-name document whose raw type is "class" (e.g. re-labelled by pack heuristics). */
+  bestClass(name){
+    const hit=this.best(name,["class"]); if(hit) return hit;
+    const n=norm(name); const rows=this.entries.filter(e=>this.allowed(e)&&String(e.rawType||"").toLowerCase()==="class"&&norm(e.name)===n).sort((a,b)=>this.priority(b)-this.priority(a));
+    return rows[0]?{...rows[0],type:"class",score:1}:null;
+  }
   bestSubclass(name,classIdentifier=""){
     const cs=this.candidates(name,["subclass"]); const id=norm(classIdentifier); if(!id) return cs[0]||null;
     return cs.find(e=>norm(e.classIdentifier)===id)||cs.find(e=>!e.classIdentifier)||null;
@@ -582,8 +622,64 @@ function parseTraitGrant(code, updates, mode="default"){
   else if(["dr","di","dv","ci"].includes(kind)) push(`system.traits.${kind}.value`,id);
 }
 
+// ---- 5etools item data -> native dnd5e item (used when Plutonium exposes data but no item converter)
+const RARITY_KEYS={common:"common",uncommon:"uncommon",rare:"rare","very rare":"veryRare",veryrare:"veryRare",legendary:"legendary",artifact:"artifact"};
+function rarityKey(r){ return RARITY_KEYS[String(r||"").trim().toLowerCase()]||""; }
+const DMG_5ET={A:"acid",B:"bludgeoning",C:"cold",F:"fire",O:"force",L:"lightning",N:"necrotic",P:"piercing",I:"poison",Y:"psychic",R:"radiant",S:"slashing",T:"thunder"};
+const PROP_5ET={A:"amm",AF:"amm",F:"fin",H:"hvy",L:"lgt",LD:"lod",R:"rch",RLD:"rel",S:"spc",T:"thr","2H":"two",V:"ver",BF:"fir"};
+function code5et(v){ return String(v?.uid||v?.property||v||"").split("|")[0].toUpperCase(); }
+function is2024Source(src){ return /^(XPHB|XDMG|XMM)$/i.test(String(src||"")); }
+/** dnd5e item type for a 5etools item record. */
+function rawItemFoundryType(it){
+  const t=code5et(it?.type);
+  if(["M","R"].includes(t)||it?.weapon||it?.weaponCategory) return "weapon";
+  if(["LA","MA","HA","S"].includes(t)||it?.armor) return "equipment";
+  if(["P","SC","WD","RD","A","AF","EXP","FD"].includes(t)) return "consumable";
+  if(["INS","AT","T","GS"].includes(t)) return "tool";
+  if(t==="RG"||it?.wondrous||it?.reqAttune||rarityKey(it?.rarity)) return "equipment";
+  return "loot";
+}
+function equipmentMiscType(want){ const misc=CONFIG?.DND5E?.miscEquipmentTypes||CONFIG?.DND5E?.equipmentTypes||{}; return (want in misc)?want:("trinket" in misc?"trinket":want); }
+/** Build a dnd5e item from 5etools JSON. Mechanics beyond damage, armor, rarity and attunement are kept as text. */
+function rawItemToNative(it, html=""){
+  const type=rawItemFoundryType(it), t=code5et(it.type), src=String(it.source||"");
+  const sys={description:{value:html,chat:""},source:{book:src,custom:"",rules:is2024Source(src)?"2024":"2014"},quantity:1,
+    weight:{value:Number(it.weight)||0,units:"lb"},price:{value:Number(it.value)?Number(it.value)/100:0,denomination:"gp"},
+    rarity:rarityKey(it.rarity),attunement:it.reqAttune?"required":"",attuned:false,equipped:false,identified:true,properties:[]};
+  const props=new Set((it.property||[]).map(code5et).map(c=>PROP_5ET[c]).filter(Boolean));
+  if(sys.rarity&&sys.rarity!=="common"||it.wondrous||it.reqAttune) props.add("mgc");
+  const out={name:it.name,type,img:"icons/svg/item-bag.svg",system:sys,effects:[],flags:{[MODULE_ID]:{rawItemFallback:true,rawItemSource:src}}};
+  if(type==="weapon"){
+    const m=/^(\d*)d(\d+)/i.exec(String(it.dmg1||"")); const ranged=t==="R";
+    sys.type={value:`${it.weaponCategory==="martial"?"martial":"simple"}${ranged?"R":"M"}`,baseItem:String(it.baseItem||"").split("|")[0].toLowerCase()};
+    sys.damage={base:{number:m?Number(m[1]||1):null,denomination:m?Number(m[2]):null,types:it.dmgType?[DMG_5ET[code5et(it.dmgType)]].filter(Boolean):[],bonus:m?"":String(it.dmg1||""),custom:{enabled:false}}};
+    const v=/^(\d*)d(\d+)/i.exec(String(it.dmg2||"")); if(v) sys.damage.versatile={number:Number(v[1]||1),denomination:Number(v[2]),types:sys.damage.base.types,bonus:""};
+    const r=/^(\d+)(?:\/(\d+))?/.exec(String(it.range||"")); if(r) sys.range={value:Number(r[1]),long:r[2]?Number(r[2]):null,units:"ft"};
+    const bonus=parseInt(String(it.bonusWeapon||"").replace("+",""),10); if(bonus) sys.magicalBonus=bonus;
+    const mastery=(it.mastery||[]).map(code5et)[0]; if(mastery) sys.mastery=mastery.toLowerCase();
+    const id=foundry.utils.randomID?.()||Math.random().toString(36).slice(2).padEnd(16,"0").slice(0,16);
+    sys.activities={[id]:{_id:id,type:"attack",sort:0,activation:{type:"action",value:1},attack:{ability:"",bonus:"",type:{value:ranged?"ranged":"melee",classification:"weapon"}},damage:{includeBase:true,parts:[]}}};
+    out.img=ranged?"icons/weapons/bows/shortbow-recurve.webp":"icons/weapons/swords/sword-guard-steel.webp";
+  }else if(type==="equipment"){
+    if(["LA","MA","HA","S"].includes(t)){
+      const kind={LA:"light",MA:"medium",HA:"heavy",S:"shield"}[t];
+      sys.type={value:kind,baseItem:String(it.baseItem||"").split("|")[0].toLowerCase()};
+      sys.armor={value:Number(it.ac)||0,magicalBonus:parseInt(String(it.bonusAc||"").replace("+",""),10)||null,dex:kind==="medium"?2:kind==="heavy"?0:null};
+      if(it.strength) sys.strength=Number(it.strength)||null;
+      if(it.stealth) props.add("stealthDisadvantage");
+    }else sys.type={value:equipmentMiscType(t==="RG"?"ring":"wondrous")};
+  }else if(type==="consumable"){
+    sys.type={value:{P:"potion",SC:"scroll",WD:"wand",RD:"rod",A:"ammo",AF:"ammo",EXP:"trinket",FD:"food"}[t]||"trinket"};
+    sys.uses={max:"1",spent:0,recovery:[],autoDestroy:t==="P"||t==="SC"};
+  }else if(type==="tool"){
+    sys.type={value:{INS:"music",AT:"art",GS:"game"}[t]||""};
+  }
+  sys.properties=[...props];
+  return out;
+}
+
 class PlutoniumBridge {
-  constructor(){this.version="";this.available=false;this.dataUtil=false;this.spellClassMap=new Map();this.rawFeats=[];this.rawFeatById=new Map();this.rawFeatLoaded=false;this.remoteUa={attempted:false,loaded:false,files:0,feats:0,error:""};}
+  constructor(){this.version="";this.available=false;this.dataUtil=false;this.spellClassMap=new Map();this.rawFeats=[];this.rawFeatById=new Map();this.rawFeatLoaded=false;this.rawItems=[];this.rawItemById=new Map();this.rawItemLoaded=false;this.itemLoadInfo="";this.remoteUa={attempted:false,loaded:false,files:0,feats:0,error:""};}
   detect(){const m=game.modules.get("plutonium");this.available=!!m?.active;this.version=m?.version||m?.manifest?.version||"";this.dataUtil=!!globalThis.DataUtil;return this.available;}
   rawFeatId(feat){const src=String(feat?.source||"UNKNOWN"),name=String(feat?.name||"");return `__rawfeat__:${encodeURIComponent(src)}:${encodeURIComponent(name)}`;}
   rawFeatEntry(feat){const id=this.rawFeatId(feat);return {name:feat.name,type:"feat",uuid:id,source:{book:feat.source||"",rules:"2024"},identifier:norm(feat.name||""),requirements:"",level:0,featType:"feat",featSubtype:"",itemTypeValue:"feat",itemBaseItem:"",mastery:"",spellClasses:[],plutonium:{page:"feats.html",source:feat.source||"",hash:(globalThis.UrlUtil?.URL_TO_HASH_BUILDER?.[globalThis.UrlUtil?.PG_FEATS]?.(feat))||`${encodeURIComponent(feat.name||"")}_${String(feat.source||"").toLowerCase()}`},rawFeat:true};}
@@ -675,6 +771,47 @@ class PlutoniumBridge {
     await this._loadRemoteUaFeats(addAll);
     this.rawFeatLoaded=true;
   }
+  // ---- 5etools items (magic items, mundane gear) from Plutonium's data layer
+  rawItemId(it){ return `__rawitem__:${encodeURIComponent(String(it?.source||"UNKNOWN"))}:${encodeURIComponent(String(it?.name||""))}`; }
+  rawItemEntry(it){ return {name:it.name,type:rawItemFoundryType(it),uuid:this.rawItemId(it),source:{book:it.source||"",rules:is2024Source(it.source)?"2024":"2014"},rarity:it.rarity||"",rawItem:true,plutonium:{source:it.source||""}}; }
+  /** Load every item Plutonium/5etools knows about, including generic variants expanded into specific items (Byeshk Greatsword). */
+  async buildItemIndex(force=false){
+    if(this.rawItemLoaded&&!force) return; this.rawItems=[]; this.rawItemById=new Map(); this.itemLoadInfo=""; this.detect();
+    const addAll=arr=>{ for(const it of (arr||[])){ if(!it?.name||it._isItemGroup) continue; const id=this.rawItemId(it); if(this.rawItemById.has(id)) continue; this.rawItemById.set(id,it); this.rawItems.push(it); } };
+    const loaders=[
+      ["Renderer.item.pBuildList",()=>globalThis.Renderer?.item?.pBuildList?.({isAddGroups:false,isBlocklistVariants:true})],
+      ["DataUtil.item.loadJSON",()=>globalThis.DataUtil?.item?.loadJSON?.()],
+      ["DataUtil.item.pLoadAll",()=>globalThis.DataUtil?.item?.pLoadAll?.()],
+    ];
+    for(const [label,fn] of loaders){
+      try{ const out=await fn(); const arr=Array.isArray(out)?out:(out?.item||out?.items); if(Array.isArray(arr)&&arr.length){ addAll(arr); this.itemLoadInfo=label; break; } }
+      catch(e){ console.warn(`${MODULE_ID} ${label} failed`,e); }
+    }
+    for(const util of [globalThis.PrereleaseUtil,globalThis.BrewUtil2,globalThis.BrewUtil]){
+      try{ if(typeof util?.pGetBrewProcessed==="function"){ const out=await util.pGetBrewProcessed(); addAll(out?.item); } }catch(e){ console.warn(`${MODULE_ID} could not read prerelease/homebrew item data`,e); }
+    }
+    this.rawItemLoaded=true;
+  }
+  rawItemCandidates(name){
+    const n=norm(name); if(!n) return [];
+    return this.rawItems.map(it=>({it,score:resolver.score(n,norm(it.name),"")})).filter(x=>x.score>=0.52)
+      .sort((a,b)=>(b.score-a.score)||((is2024Source(b.it.source)?1:0)-(is2024Source(a.it.source)?1:0)))
+      .slice(0,6).map(x=>({...this.rawItemEntry(x.it),score:x.score}));
+  }
+  itemConverters(){ return [globalThis.DataConverterItem,globalThis.plutonium?.DataConverterItem,game.modules.get("plutonium")?.api?.importer?.DataConverterItem].filter(Boolean); }
+  async rawItemToItemData(id){
+    const it=this.rawItemById.get(id); if(!it) return null;
+    // Prefer Plutonium's own converter (full activities and effects) when the running build exposes it.
+    for(const c of this.itemConverters()) for(const fn of ["pGetItemItem","pGetDocumentJson","pGetDocumentData","pGetItem"]){
+      if(typeof c?.[fn]!=="function") continue;
+      try{ const out=await c[fn](it,{actor:null,isActorItem:true}); const d=out?.toObject?.()||out?.item?.toObject?.()||out?.item||out; if(d?.type&&d?.name) return deepClone(d); }
+      catch(e){ console.warn(`${MODULE_ID} Plutonium item converter ${fn} failed`,e); }
+    }
+    let html="";
+    try{ const R=globalThis.Renderer; if(R?.get) html=R.get().render({type:"entries",entries:it.entries||[]}); }catch(e){ console.warn(`${MODULE_ID} could not render raw item`,e); }
+    if(!html){ try{ html=(it.entries||[]).map(x=>typeof x==="string"?`<p>${esc(x)}</p>`:`<p>${esc(JSON.stringify(x))}</p>`).join(""); }catch(_){ html=""; } }
+    return rawItemToNative(it,html);
+  }
   rawFeatSources(){const m=new Map();for(const f of this.rawFeats){const s=String(f.source||"").trim();if(s)m.set(s,(m.get(s)||0)+1);}return [...m.entries()].map(([code,count])=>({code,count}));}
   rawFeatEntries(enabledSources=null){return this.rawFeats.filter(f=>!enabledSources||enabledSources.has(String(f.source||""))).map(f=>this.rawFeatEntry(f));}
   rawFeatFromId(id){return this.rawFeatById.get(id)||null;}
@@ -691,8 +828,9 @@ class PlutoniumBridge {
     const subtype=/origin/i.test(String(feat.category||feat.featCategory||""))?"origin":"";
     return {name:feat.name,type:"feat",img:feat.img||"icons/svg/book.svg",system:{source:{custom:"",book:String(feat.source||""),page:"",license:"",rules:"2024",revision:1},description:{value:html,chat:""},requirements:"",prerequisites:{level:null,items:[],repeatable:false},uses:{max:"",spent:0,recovery:[]},type:{value:"feat",subtype},properties:[],advancement:{},activities:{},identifier:norm(feat.name||"").replace(/ /g,"-")},flags:{plutonium:{page:"feats.html",source:String(feat.source||""),hash:this.rawFeatEntry(feat).plutonium.hash},[MODULE_ID]:{rawPlutoniumFeat:true}},effects:[]};
   }
-  async buildSpellClassMap(){
-    this.detect(); this.spellClassMap.clear();
+  async buildSpellClassMap(force=false){
+    if(this.spellClassMapLoaded&&!force) return;
+    this.detect(); this.spellClassMap.clear(); this.spellClassMapLoaded=true;
     // Prefer Plutonium/5eTools' already-loaded data layer. This keeps prerelease/homebrew compatibility when exposed.
     try{
       const du=globalThis.DataUtil; let spells=null;
@@ -723,6 +861,7 @@ function flattenOwned(data){
 }
 
 const MATCH_CONFIDENT=0.85;
+const EQUIP_TYPES=["equipment","weapon","consumable","loot","tool","container"];
 
 /** Write dnd5e 5.x spell preparation fields, plus the legacy fields for systems that still use them. */
 function setSpellFields(d,{method,prepared,sourceItem,ability}={}){
@@ -787,9 +926,189 @@ function spellLimitsFromDoc(doc,level){
   return {cantrips:cant?scaleValueAt(cant,level):undefined,prepared:prep?scaleValueAt(prep,level):undefined};
 }
 
+/* ===================================================================================== */
+/* Shared services: recent errors, remembered item matches, diagnostics, Roll20 export   */
+/* ===================================================================================== */
+function moduleVersion(){ return game.modules.get(MODULE_ID)?.version||""; }
+function moduleUrl(path){ const p=`modules/${MODULE_ID}/${path}`; try{ return foundry.utils.getRoute?.(p)??p; }catch(_){ return p; } }
+
+/** The last few errors, so "Copy diagnostics" can include them. */
+const recentErrors=[];
+function logImportError(context,err){
+  recentErrors.push({at:new Date().toISOString(),context,message:String(err?.message||err),stack:String(err?.stack||"").split("\n").slice(1,4).map(s=>s.trim()).join(" | ")});
+  if(recentErrors.length>20) recentErrors.shift();
+}
+
+function isActiveGM(){ const gm=game.users?.activeGM; if(gm) return gm.isSelf??(gm.id===game.user?.id); return !!game.user?.isGM; }
+const SOCKET=`module.${MODULE_ID}`;
+
+/**
+ * Item matches people chose by hand ("Cloak of Many Fashions" → some compendium item), reused for every later import.
+ * Players cannot write world settings, so a player's pick is saved on their own user (used right away for their imports)
+ * and sent to the active GM, who merges it into the world list. Newer picks win.
+ */
+const itemMemory={
+  key(name){ return norm(name).replace(/ /g,"_"); },
+  world(){ try{ return game.settings.get(MODULE_ID,"itemMatches")||{}; }catch(_){ return {}; } },
+  mine(){ try{ return game.user?.getFlag?.(MODULE_ID,"itemMatches")||{}; }catch(_){ return {}; } },
+  all(){ return {...this.world(),...this.mine()}; },
+  get(name){ return this.all()[this.key(name)]||null; },
+  newer(a,b){ return !a||Number(b?.at||0)>=Number(a?.at||0); },
+  async remember(list){
+    const rec={};
+    for(const e of list||[]) if(e?.name&&e?.uuid&&e.uuid!=="__placeholder__") rec[this.key(e.name)]={name:e.name,uuid:e.uuid,label:e.label||"",by:game.user?.name||"",at:Date.now()};
+    if(!Object.keys(rec).length) return;
+    if(game.user?.isGM) return this.merge(rec);
+    try{ await game.user.setFlag(MODULE_ID,"itemMatches",{...this.mine(),...rec}); }catch(e){ console.warn(`${MODULE_ID} | could not save item matches on your user`,e); }
+    try{ game.socket?.emit(SOCKET,{type:"itemMatches",rec}); }catch(_){}
+  },
+  /** Only the active GM writes the world setting. */
+  async merge(rec){
+    if(!isActiveGM()) return; const cur={...this.world()}; let changed=false;
+    for(const [k,v] of Object.entries(rec||{})) if(this.newer(cur[k],v)&&JSON.stringify(cur[k])!==JSON.stringify(v)){ cur[k]=v; changed=true; }
+    if(changed) await game.settings.set(MODULE_ID,"itemMatches",cur);
+  },
+  /** Picks players made while no GM was online. */
+  async collectFromUsers(){
+    if(!isActiveGM()) return; const rec={};
+    for(const u of (game.users?.contents||[...(game.users||[])])){ const f=u.getFlag?.(MODULE_ID,"itemMatches")||{}; for(const [k,v] of Object.entries(f)) if(this.newer(rec[k],v)) rec[k]=v; }
+    await this.merge(rec);
+  },
+  async _dropFromUser(u,keys){ const f={...(u.getFlag?.(MODULE_ID,"itemMatches")||{})}; const before=Object.keys(f).length; for(const k of keys) delete f[k]; if(Object.keys(f).length===before) return; await u.unsetFlag(MODULE_ID,"itemMatches"); if(Object.keys(f).length) await u.setFlag(MODULE_ID,"itemMatches",f); },
+  async forget(keys){
+    if(game.user?.isGM){
+      const cur={...this.world()}; for(const k of keys) delete cur[k]; await game.settings.set(MODULE_ID,"itemMatches",cur);
+      for(const u of (game.users?.contents||[...(game.users||[])])) await this._dropFromUser(u,keys);
+    } else await this._dropFromUser(game.user,keys);
+  }
+};
+
+/** GM screen listing remembered item matches. */
+class ItemMemoryApp extends foundry.applications.api.ApplicationV2 {
+  static DEFAULT_OPTIONS={ id:`${MODULE_ID}-item-memory`, window:{title:"Remembered Item Matches",resizable:true}, position:{width:680,height:540} };
+  async _renderHTML(){
+    const root=document.createElement("div"); root.className="cbi cbi-memory";
+    const rows=Object.entries(itemMemory.world()).sort((a,b)=>String(a[1].name).localeCompare(String(b[1].name)));
+    root.innerHTML=`<div class="cbi-body"><p>When anyone picks an item match by hand during an import, it is remembered here and used automatically for every later import in this world. Forget a row to go back to automatic matching.</p>
+      ${rows.length?`<table class="memory-table"><thead><tr><th>Item in the export</th><th>Matched to</th><th>Picked by</th><th></th></tr></thead><tbody>${rows.map(([k,v])=>`<tr><td>${esc(v.name)}</td><td>${esc(v.label||uuidLabelFallback(v.uuid))}</td><td>${esc(v.by||"")}</td><td><button type="button" data-forget="${esc(k)}">Forget</button></td></tr>`).join("")}</tbody></table><p><button type="button" data-forget-all>Forget all</button></p>`:`<p class="muted">Nothing remembered yet.</p>`}</div>`;
+    return root;
+  }
+  _replaceHTML(result,content){
+    content.replaceChildren(result);
+    content.querySelectorAll("[data-forget]").forEach(b=>b.addEventListener("click",async()=>{ await itemMemory.forget([b.dataset.forget]); this.render(); }));
+    content.querySelector("[data-forget-all]")?.addEventListener("click",async()=>{ await itemMemory.forget(Object.keys(itemMemory.world())); this.render(); });
+  }
+}
+
+/** Plain-text report for bug reports: versions, content found, this import's open questions and recent errors. */
+async function diagnosticsReport(app=null){
+  const L=[]; const mod=game.modules.get(MODULE_ID), pl=game.modules.get("plutonium"), ddb=game.modules.get("ddb-importer");
+  L.push(`D&D Friends Character Importer ${mod?.version||"?"}`);
+  L.push(`Foundry ${game.version||game.release?.version||"?"} · ${game.system?.id||"?"} ${game.system?.version||"?"} · ${game.user?.isGM?"GM":"player"}${game.user?.can?.("ACTOR_CREATE")?" (can create actors)":""}`);
+  L.push(`Plutonium: ${pl?.active?`active ${pl.version||""}`:"not active"} · DDB Importer: ${ddb?.active?`active ${ddb.version||""}`:"not active"}`);
+  L.push(`Index: ${resolver.loaded?"loaded":"not loaded yet"} · ${resolver.packCount??"?"} packs · ${resolver.entries.length} 2024 entries · ${resolver.excludedEntries.length} other entries`);
+  L.push(`5etools items: ${plutoniumBridge.rawItems?.length||0} (${plutoniumBridge.itemLoadInfo||"none"}) · raw feats: ${plutoniumBridge.rawFeats?.length||0} · Plutonium item converter: ${plutoniumBridge.itemConverters().length?"yes":"no"}`);
+  L.push(`Remembered item matches: ${Object.keys(itemMemory.world()).length} in the world, ${Object.keys(itemMemory.mine()).length} on your user`);
+  if(app?.data){
+    const d=app.data;
+    L.push("",`Character: ${d.Name} · level ${d.Level} · ${d.Race} · ${Object.entries(d.Class||{}).map(([k,v])=>`${k} ${v.Level}${v.Subclass?` (${v.Subclass})`:""}`).join(" / ")}`);
+    L.push(`File: ${app.fileName} · Mode: ${app.targetActorId?`update "${game.actors?.get(app.targetActorId)?.name||app.targetActorId}"`:"new character"}${app.savedFrom?" · saved choices restored":""}`);
+    for(const x of app.coreDocs||[]) L.push(`  ${x.kind}: ${x.name} → ${x.doc?.name||"?"} [${x.uuid}]`);
+    try{ const st=app.importStatus(); for(const [label,list] of [["Must choose",st.block],["Worth a look",st.warn]]) if(list.length){ L.push(`${label}:`); for(const r of list) L.push(`  - ${r.text}`); } }
+    catch(e){ L.push(`(could not build the import status: ${e.message})`); }
+  }
+  if(recentErrors.length){ L.push("","Recent errors:"); for(const e of recentErrors) L.push(`  [${e.at}] ${e.context}: ${e.message}${e.stack?` | ${e.stack}`:""}`); }
+  return L.join("\n");
+}
+async function copyDiagnostics(app=null){
+  const text=await diagnosticsReport(app);
+  try{ await navigator.clipboard.writeText(text); ui.notifications.info("Diagnostics copied. Paste them into Discord or a GitHub issue."); }
+  catch(_){ await foundry.applications.api.DialogV2.prompt({window:{title:"Importer diagnostics"},content:`<p>Copy this text:</p><textarea readonly style="width:100%;height:320px">${esc(text)}</textarea>`,ok:{label:"Close"}}); }
+  return text;
+}
+
+/* ---------------- Roll20 export: the converter's own Python code, run in the browser with Pyodide ---------------- */
+const PYODIDE_DEFAULT="https://cdn.jsdelivr.net/pyodide/v0.27.7/full/";
+let pyodidePromise=null;
+function loadRoll20Converter(){
+  if(pyodidePromise) return pyodidePromise;
+  pyodidePromise=(async()=>{
+    let base=PYODIDE_DEFAULT; try{ base=game.settings.get(MODULE_ID,"pyodideUrl")||PYODIDE_DEFAULT; }catch(_){}
+    base=base.replace(/\/?$/,"/");
+    if(!globalThis.loadPyodide) await new Promise((res,rej)=>{ const s=document.createElement("script"); s.src=`${base}pyodide.js`; s.onload=res; s.onerror=()=>rej(new Error(`Could not load the Python runtime from ${base}. Check your internet connection, or set "Python runtime URL" in the module settings.`)); document.head.append(s); });
+    const py=await globalThis.loadPyodide({indexURL:base});
+    const {CONVERTER_PY:src}=await import("./roll20-converter.js");
+    py.FS.writeFile("/home/pyodide/converter.py",src); await py.runPythonAsync("import sys\nif '/home/pyodide' not in sys.path: sys.path.insert(0,'/home/pyodide')\nimport converter");
+    return py;
+  })();
+  pyodidePromise.catch(()=>{ pyodidePromise=null; });
+  return pyodidePromise;
+}
+function actorExportJson(actor){
+  const data=actor.toObject?actor.toObject():foundry.utils.deepClone(actor);
+  data.flags=data.flags||{}; data.flags.exportSource={world:game.world?.id,system:game.system?.id,coreVersion:game.version,systemVersion:game.system?.version};
+  return JSON.stringify(data);
+}
+function downloadText(name,text,type="application/json"){
+  if(typeof globalThis.saveDataToFile==="function") return globalThis.saveDataToFile(text,type,name);
+  if(foundry.utils?.saveDataToFile) return foundry.utils.saveDataToFile(text,type,name);
+  const blob=new Blob([text],{type}),url=URL.createObjectURL(blob),a=document.createElement("a"); a.href=url; a.download=name; document.body.append(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(url),1000);
+}
+function safeFileName(name){ return String(name||"character").replace(/[^\p{L}\p{N}._-]+/gu,"-").replace(/^-|-$/g,"")||"character"; }
+
+class Roll20ExportApp extends foundry.applications.api.ApplicationV2 {
+  static DEFAULT_OPTIONS={ window:{title:"Export to Roll20",resizable:true}, position:{width:620,height:640} };
+  constructor(actor,options={}){ super({...options,id:`${MODULE_ID}-roll20-${actor.id}`}); this.actor=actor; this.status="Loading the converter… The first time downloads the Python runtime (about 10 MB)."; this.manifest=null; this.ability=""; this.effects={}; this.report=""; this.busy=true; this.converterVersion=""; }
+  get title(){ return `Export to Roll20: ${this.actor.name}`; }
+  async _renderHTML(){
+    const root=document.createElement("div"); root.className="cbi cbi-roll20"; const m=this.manifest; const AB={str:"Strength",dex:"Dexterity",con:"Constitution",int:"Intelligence",wis:"Wisdom",cha:"Charisma"};
+    root.innerHTML=`<div class="cbi-body"><h2>${esc(this.actor.name)} → Roll20</h2>
+      <p class="muted">Makes a JSON file for Roll20's 2014 character sheet, using the same converter as the website${this.converterVersion?` (converter ${esc(this.converterVersion)})`:""}.</p>
+      ${m?`<div class="summary"><span>Level ${esc(m.summary?.level??"?")}</span><span>HP ${esc(m.summary?.hp_max??"?")}</span><span>AC ${esc(m.summary?.ac??"?")}</span><span>Speed ${esc(m.summary?.speed??"?")}</span><span>${m.attacks.length} attacks · ${m.spells.length} spells · ${m.resources.filter(r=>r.selected).length} resources</span></div>
+        <div class="form-row r20-row"><label>Spellcasting ability</label><select data-r20-ability><option value="">Auto${m.spell_ability?` (${AB[m.spell_ability]||m.spell_ability})`:""}</option>${ABILITIES.map(a=>`<option value="${a}" ${this.ability===a?"selected":""}>${AB[a]}</option>`).join("")}</select></div>
+        ${m.effects?.length?`<div class="review-section"><h4>Temporary effects active right now</h4><p class="muted">Ticked effects are baked into the Roll20 sheet. Usually leave Rage, Bless and similar unticked.</p>${m.effects.map(e=>`<label class="r20-effect"><input type="checkbox" data-r20-effect="${esc(e.id)}" ${(this.effects[e.id]??e.included)?"checked":""}> ${esc(e.name)}</label>`).join("")}</div>`:""}
+        ${m.warnings?.length?`<div class="warning"><b>Check before converting</b><ul>${m.warnings.map(w=>`<li>${esc(w)}</li>`).join("")}</ul></div>`:""}`:""}
+      <p class="cbi-busy-line ${this.error?"error":""}">${esc(this.status)}</p>
+      ${this.report?`<details class="review-section"><summary>Conversion report</summary><pre class="r20-report">${esc(this.report)}</pre></details>`:""}
+      <p class="muted">In Roll20, import the file with your usual character-import tool, then roll a skill, a weapon and a spell to check it.</p></div>
+      <div class="cbi-nav"><span class="nav-left">${this.report?`<button type="button" data-r20-report>Download report</button>`:""}</span><span></span><button type="button" class="create" data-r20-convert ${!m||this.busy?"disabled":""}><i class="fa-solid fa-download"></i> Download Roll20 JSON</button></div>`;
+    return root;
+  }
+  _replaceHTML(result,content){
+    content.replaceChildren(result);
+    content.querySelector("[data-r20-ability]")?.addEventListener("change",async e=>{ this.ability=e.target.value; await this.loadManifest(); });
+    content.querySelectorAll("[data-r20-effect]").forEach(c=>c.addEventListener("change",e=>{ this.effects[e.target.dataset.r20Effect]=e.target.checked; }));
+    content.querySelector("[data-r20-convert]")?.addEventListener("click",()=>this.convert());
+    content.querySelector("[data-r20-report]")?.addEventListener("click",()=>downloadText(`${safeFileName(this.actor.name)}-roll20-report.txt`,this.report,"text/plain"));
+  }
+  async _onFirstRender(...args){ await super._onFirstRender?.(...args); this.loadManifest(); }
+  async run(code,vars){ const py=await loadRoll20Converter(); for(const [k,v] of Object.entries(vars)) py.globals.set(k,v); return py.runPythonAsync(code); }
+  async loadManifest(){
+    this.busy=true; this.error=false; this.render();
+    try{
+      const py=await loadRoll20Converter(); this.converterVersion=py.runPython("import converter; converter.VERSION");
+      const text=await this.run("import json, converter\n_m=converter.review_manifest(json.loads(actor_json), chosen_ability or None)\njson.dumps(_m, ensure_ascii=False)",{actor_json:actorExportJson(this.actor),chosen_ability:this.ability});
+      this.manifest=JSON.parse(text); this.status="Ready."; 
+    }catch(e){ console.error(e); logImportError("Roll20 export (reading the character)",e); this.error=true; this.status=`Could not read the character: ${String(e.message||e).split("\n").filter(Boolean).slice(-1)[0]}`; }
+    finally{ this.busy=false; this.render(); }
+  }
+  async convert(){
+    if(this.busy||!this.manifest) return; this.busy=true; this.error=false; this.status="Converting…"; this.render();
+    try{
+      const effects=Object.fromEntries((this.manifest.effects||[]).map(e=>[e.id,this.effects[e.id]??!!e.included]));
+      const out=JSON.parse(await this.run("import json, converter\n_a=json.loads(actor_json)\n_o,_r=converter.convert(_a, chosen_ability or None, None, review=json.loads(review_json))\njson.dumps({'output':json.dumps(_o,ensure_ascii=False,indent=2),'report':converter.report_text(_r),'warnings':len(_r['warnings'])},ensure_ascii=False)",
+        {actor_json:actorExportJson(this.actor),chosen_ability:this.ability,review_json:JSON.stringify({effects})}));
+      downloadText(`${safeFileName(this.actor.name)}-roll20.json`,out.output); this.report=out.report;
+      this.status=`Downloaded ${safeFileName(this.actor.name)}-roll20.json${out.warnings?`. ${out.warnings} item(s) to check are listed in the report`:""}.`;
+    }catch(e){ console.error(e); logImportError("Roll20 export",e); this.error=true; this.status=`Conversion failed: ${String(e.message||e).split("\n").filter(Boolean).slice(-1)[0]}`; }
+    finally{ this.busy=false; this.render(); }
+  }
+}
+function openRoll20Export(actor){ if(!actor) return; if(actor.type!=="character") return ui.notifications.warn("Only player characters can be exported to Roll20."); new Roll20ExportApp(actor).render({force:true}); }
+
 class ImportWizard extends foundry.applications.api.ApplicationV2 {
   static DEFAULT_OPTIONS={ id:"dnd-friends-character-importer", window:{title:"D&D Friends Character Importer",resizable:true}, position:{width:980,height:760} };
-  constructor(options={}){ super(options); this.enabledSources=null; this.sourceSearch=""; this.creating=false; this.busy=""; this.resetForNewExport(); }
+  constructor(options={}){ super(options); this.enabledSources=null; this.sourceSearch=""; this.creating=false; this.busy=""; this.backup=true; this.resetForNewExport(); }
   /** Everything that belongs to one character. Source-filter preferences survive between exports. */
   resetForNewExport(){
     this.step=0; this.data=null; this.fileName=""; this.skills=[]; this.classOrder=[]; this.hpOverride=""; this.matches=new Map(); this.spells=new Set();
@@ -798,12 +1117,15 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
     this.featurePlacements=new Map(); this.choicePlacements=new Map(); this.grantedSpells=new Map(); this.resilientSave=""; this.ownerId="";
     this.finalTraits={dr:new Set(),di:new Set(),dv:new Set(),ci:new Set(),languages:new Set(),tools:new Set(),senses:{darkvision:"",blindsight:"",tremorsense:"",truesight:""}};
     this.traitsSignature=null; this.spellLevelFilter="all"; this._low=new Set(); this.confirmed=new Set();
+    this.remembered=new Set(); this.savedFrom=null; this._pendingSpells=null; this.targetActorId=""; this.sourceText="";
   }
   async _renderHTML(){ const root=document.createElement("div"); root.className="cbi"; root.innerHTML=this.view(); return root; }
   _replaceHTML(result,content){ content.replaceChildren(result); this.bind(content); }
   /** Re-render without jumping back to the top of the step. */
   async rerender(){ const top=this.element?.querySelector(".cbi-body")?.scrollTop||0; await this.render(); const body=this.element?.querySelector(".cbi-body"); if(body) body.scrollTop=top; }
   setBusy(msg=""){ this.busy=msg; const el=this.element?.querySelector(".cbi-busy"); if(el) el.textContent=msg; this.element?.querySelectorAll("[data-act]").forEach(b=>b.disabled=!!msg||(b.dataset.act==="next"&&!this.data)); }
+  /** Hit die per class from the matched class documents, e.g. {psion: 6}. */
+  hitDiceByClass(){ const out={}; for(const x of this.coreDocs||[]) if(x.kind==="class"){ const n=parseInt(String(x.doc?.system?.hd?.denomination||x.doc?.system?.hitDice||"").replace(/^d/i,""),10); if(n) out[norm(x.name)]=n; } return out; }
   characterLevel(){ return Number(this.data?.Level||0)||defaultClassOrder(this.data||{}).length||1; }
 
   speciesCandidates(){
@@ -900,13 +1222,14 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
       const first=norm(this.classOrder[0]||""); const charLevel=this.characterLevel();
       const race=this.selectedSpeciesEntry(); if(race){this.speciesUuid=race.uuid;const d=await getDoc(race.uuid);if(d)this.coreDocs.push({kind:"race",name:normalizeSpeciesName(this.data.Race),doc:d,uuid:race.uuid,level:charLevel,isPrimary:true});}
       for(const [cn,c] of Object.entries(this.data.Class||{})){
-        const m=resolver.best(cn,["class"]); let classDoc=null;
+        const m=resolver.bestClass(cn); let classDoc=null;
         if(m){classDoc=await getDoc(m.uuid);if(classDoc)this.coreDocs.push({kind:"class",name:cn,doc:classDoc,uuid:m.uuid,level:Number(c.Level||1),isPrimary:norm(cn)===first});}
         if(c.Subclass){const sm=resolver.bestSubclass(c.Subclass,classDoc?.system?.identifier||norm(cn).replace(/ /g,"-"));if(sm){const sd=await getDoc(sm.uuid);if(sd)this.coreDocs.push({kind:"subclass",name:c.Subclass,className:cn,doc:sd,uuid:sm.uuid,level:Number(c.Level||1),isPrimary:norm(cn)===first});}}
       }
       this.ensureCasterProfiles();
       this.setBusy("Loading feat and spell data…");
       await plutoniumBridge.buildFeatIndex();
+      await plutoniumBridge.buildItemIndex();
       await plutoniumBridge.buildSpellClassMap();
       await this.rebuildChoiceDefs();
       await this.buildGrantedSpells();
@@ -1034,16 +1357,149 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
     const help=this.choiceHelp(def);
     return `<div class="adv-choice" data-choice-def="${esc(def.id)}"><h4>${this.choiceHeading(def)} <small>Choose ${def.count}</small> <span class="choice-help" title="${esc(help)}" aria-label="${esc(help)}" tabindex="0"><i class="fa-solid fa-circle-question"></i></span></h4><div class="choice-placement">${this.choicePlacementSelect(def)}</div><p class="choice-instructions">${esc(help)}</p>${def.isMagicInitiate&&def.type==="spell-choice"?this.magicInitiateSelect():""}${empty}<div class="skill-grid">${def.options.map(o=>`<label title="Select ${esc(o.label)} for ${esc(def.title||'this feature')}"><input data-adv-choice="${esc(def.id)}" value="${esc(o.value)}" type="checkbox" ${sel.includes(o.value)?'checked':''} ${!sel.includes(o.value)&&sel.length>=required?'disabled':''}> ${esc(o.label)}</label>`).join("")}</div>${mi?`<div data-mi-wrap="${esc(def.id)}" style="${miSelected?'':'display:none'}">${this.magicInitiateSelect()}</div>`:""}</div>`;
   }
-  view(){ const heads=["Upload","Core & HP","Skills & Feats","Spells","Equipment","Final Traits","Review"]; return `<div class="cbi-steps">${heads.map((h,i)=>`<div class="${i===this.step?'active':''} ${i<this.step?'done':''}">${i+1}. ${h}</div>`).join("")}</div><div class="cbi-body">${[this.uploadView,this.coreView,this.choiceView,this.spellView,this.equipView,this.finalTraitsView,this.reviewView][this.step].call(this)}</div><div class="cbi-nav">${this.step?'<button type="button" data-act="back"><i class="fa-solid fa-arrow-left"></i> Back</button>':'<span></span>'}<span class="cbi-busy" role="status">${esc(this.busy)}</span>${this.step<6?`<button type="button" data-act="next" ${!this.data||this.busy?'disabled':''}>Next <i class="fa-solid fa-arrow-right"></i></button>`:`<button type="button" class="create" data-act="create" ${this.creating?'disabled':''}><i class="fa-solid fa-user-plus"></i> Create Actor</button>`}</div>`; }
+  view(){ const heads=["Upload","Core & HP","Skills & Feats","Spells","Equipment","Final Traits","Review"]; return `<div class="cbi-steps">${heads.map((h,i)=>`<div class="${i===this.step?'active':''} ${i<this.step?'done':''}">${i+1}. ${h}</div>`).join("")}</div><div class="cbi-body">${[this.uploadView,this.coreView,this.choiceView,this.spellView,this.equipView,this.finalTraitsView,this.reviewView][this.step].call(this)}</div><div class="cbi-nav">${this.step?`<span class="nav-left"><button type="button" data-act="back"><i class="fa-solid fa-arrow-left"></i> Back</button>${this.data?'<button type="button" data-act="overview">Overview</button>':""}</span>`:'<span></span>'}<span class="cbi-busy" role="status">${esc(this.busy)}</span>${this.step<6?`<button type="button" data-act="next" ${!this.data||this.busy?'disabled':''}>Next <i class="fa-solid fa-arrow-right"></i></button>`:`<button type="button" class="create" data-act="create" ${this.creating?'disabled':''}><i class="fa-solid ${this.targetActorId?"fa-arrows-rotate":"fa-user-plus"}"></i> ${this.targetActorId?"Update Actor":"Create Actor"}</button>`}</div>`; }
   sourceFilterView(){
     const merged=new Map();for(const x of [...resolver.plutoniumSources(),...plutoniumBridge.rawFeatSources()])merged.set(x.code,(merged.get(x.code)||0)+x.count);const sources=[...merged.entries()].map(([code,count])=>({code,count})).sort((a,b)=>a.code.localeCompare(b.code)); if(!sources.length)return"";
     if(this.enabledSources===null){ this.enabledSources=new Set(sources.map(x=>x.code)); resolver.setEnabledPlutoniumSources(this.enabledSources); }
     const q=norm(this.sourceSearch); const shown=sources.filter(x=>!q||norm(x.code).includes(q));
     return `<details class="source-filter" ${this.data?'':'open'}><summary>5etools / Plutonium Sources <small>${this.enabledSources.size}/${sources.length} enabled</small></summary><p class="muted">Native dnd5e 2024 content is always available. These switches control Plutonium/5etools material used for feats, spells, items, subclasses, and matching.</p><div class="source-toolbar"><input class="search" data-source-search value="${esc(this.sourceSearch)}" placeholder="Filter source codes…"><button type="button" data-source-all>Enable All</button><button type="button" data-source-none>Disable All</button></div><div class="source-grid">${shown.map(x=>`<label data-source-row="${esc(norm(x.code))}"><input type="checkbox" data-source-code="${esc(x.code)}" ${this.enabledSources.has(x.code)?"checked":""}><span>${esc(sourceDisplayName(x.code))}</span><small>${x.count}</small></label>`).join("")}</div></details>`;
   }
-  uploadView(){ return `<section><h2>Import Discord Character Export</h2><p>Upload the bot's <code>.json</code> export. Standard JSON and the server bot's Python-style dictionary format are both accepted. Choosing a new file starts a fresh import.</p><label class="drop"><i class="fa-solid fa-file-arrow-up"></i><strong>${this.data?esc(this.fileName):"Choose export file"}</strong><input data-file type="file" accept=".json,.txt,application/json,text/plain"></label>${this.data?`<div class="summary"><b>${esc(this.data.Name)}</b><span>Level ${Number(this.data.Level||0)}</span><span>${esc(this.data.Race||"Unknown species")}</span><span>${Object.entries(this.data.Class||{}).map(([k,v])=>`${esc(k)} ${v.Level}${v.Subclass?` (${esc(v.Subclass)})`:""}`).join(" / ")}</span></div>`:""}${this.sourceFilterView()}</section>`; }
+  /** Everything chosen in the wizard, saved on the actor so a re-import or level-up starts from it. */
+  snapshotChoices(){
+    const owned=flattenOwned(this.data||{}); const equipment={};
+    owned.forEach((x,i)=>{ const id=`eq:${i}`, st=this.equipment.get(id)||{}, rec={};
+      if(this.confirmed.has(id)||this.remembered.has(id)) rec.uuid=this.matches.get(id)||"";
+      if("equipped" in st) rec.equipped=!!st.equipped; if("attuned" in st) rec.attuned=!!st.attuned;
+      if(Object.keys(rec).length) equipment[x.key]=rec; });
+    const sets=k=>[...this.finalTraits[k]];
+    return { module:moduleVersion(), savedAt:Date.now(), level:this.characterLevel(), skills:[...this.skills], classOrder:[...this.classOrder], hpOverride:this.hpOverride||"",
+      featMatches:Object.fromEntries([...this.matches].filter(([k])=>k.startsWith("feat:"))), equipment,
+      spells:[...this.spells], spellClassAssignments:Object.fromEntries(this.spellClassAssignments), advChoices:Object.fromEntries(this.advChoices),
+      magicInitiateList:this.magicInitiateList, casterProfiles:Object.fromEntries([...this.casterProfiles].map(([k,p])=>[k,{progression:p.progression,ability:p.ability,maxOverride:p.maxOverride??""}])),
+      speciesUuid:this.speciesUuid||"", featurePlacements:Object.fromEntries(this.featurePlacements), choicePlacements:Object.fromEntries(this.choicePlacements),
+      resilientSave:this.resilientSave||"", featBonusesInStats:!!this.data?.__featBonusesInStats,
+      finalTraits:{dr:sets("dr"),di:sets("di"),dv:sets("dv"),ci:sets("ci"),languages:sets("languages"),tools:sets("tools"),senses:{...this.finalTraits.senses}} };
+  }
+  /** Restore a snapshot before matching runs. Choices whose source no longer exists are dropped by the normal rebuild. */
+  applySavedChoices(saved){
+    if(!saved||typeof saved!=="object"||!this.data) return false;
+    this.savedFrom=saved;
+    if(Array.isArray(saved.skills)&&saved.skills.length===2&&saved.skills.every(k=>SKILLS[k])) this.skills=[...saved.skills];
+    if(Array.isArray(saved.classOrder)&&saved.classOrder.length){
+      // Keep the saved order for the levels the character already had, then add any new levels.
+      const left=Object.fromEntries(Object.entries(this.data.Class||{}).map(([cn,c])=>[cn,Number(c.Level||0)])); const out=[];
+      for(const cn of saved.classOrder) if(left[cn]>0){ out.push(cn); left[cn]--; }
+      for(const cn of defaultClassOrder(this.data)) if(left[cn]>0){ out.push(cn); left[cn]--; }
+      if(out.length) this.classOrder=out;
+    }
+    if(saved.hpOverride&&Number(saved.level)===this.characterLevel()) this.hpOverride=saved.hpOverride;
+    const feats=new Set(uniqueFeatNames(this.data).map(f=>`feat:${f}`));
+    for(const [k,v] of Object.entries(saved.featMatches||{})) if(feats.has(k)&&v){ this.matches.set(k,v); this.confirmed.add(k); }
+    if(saved.featBonusesInStats) Object.defineProperty(this.data,"__featBonusesInStats",{value:true,enumerable:false,writable:true,configurable:true});
+    if(saved.speciesUuid) this.speciesUuid=saved.speciesUuid;
+    if(saved.magicInitiateList) this.magicInitiateList=saved.magicInitiateList;
+    if(saved.resilientSave) this.resilientSave=saved.resilientSave;
+    for(const [k,v] of Object.entries(saved.advChoices||{})) if(Array.isArray(v)&&v.length) this.advChoices.set(k,[...v]);
+    for(const [k,v] of Object.entries(saved.featurePlacements||{})) this.featurePlacements.set(k,v);
+    for(const [k,v] of Object.entries(saved.choicePlacements||{})) this.choicePlacements.set(k,v);
+    for(const [cn,p] of Object.entries(saved.casterProfiles||{})) if(this.data.Class?.[cn]&&p) this.casterProfiles.set(cn,{progression:p.progression,ability:p.ability,maxOverride:p.maxOverride??""});
+    flattenOwned(this.data).forEach((x,i)=>{ const r=saved.equipment?.[x.key]; if(!r) return; const id=`eq:${i}`;
+      if(r.uuid){ this.matches.set(id,r.uuid); this.confirmed.add(id); }
+      const st={}; if("equipped" in r) st.equipped=!!r.equipped; if("attuned" in r) st.attuned=!!r.attuned; if(Object.keys(st).length) this.equipment.set(id,st); });
+    this._pendingSpells={spells:Array.isArray(saved.spells)?saved.spells:[],assign:saved.spellClassAssignments||{}};
+    return true;
+  }
+  restorePendingSpells(){
+    const p=this._pendingSpells; this._pendingSpells=null; if(!p) return;
+    const known=new Set(resolver.entries.map(e=>e.uuid));
+    for(const u of p.spells) if(known.has(u)){ this.spells.add(u); const cn=p.assign[u]; if(cn&&this.data.Class?.[cn]) this.spellClassAssignments.set(u,cn); }
+  }
+  /** Characters this user may update: their own player characters. Backups are never offered automatically. */
+  updateCandidates(){ return (game.actors?.contents||[...(game.actors||[])]).filter(a=>a.type==="character"&&(a.isOwner??true)); }
+  findExistingActor(){
+    const name=norm(this.data?.Name||""); if(!name) return null;
+    const cs=this.updateCandidates().filter(a=>a.flags?.[MODULE_ID]&&!a.flags[MODULE_ID].backupOf);
+    return cs.find(a=>norm(a.flags[MODULE_ID].rawExport?.Name||"")===name)||cs.find(a=>norm(a.name)===name)||null;
+  }
+  /** Read an export, pick the character to update (if any), restore its saved choices and match everything. */
+  async loadExport(text,fileName,{targetId}={}){
+    const data=parseBotExport(text); if(!data||typeof data!=="object"||!Object.keys(data.Class||{}).length) throw new Error("This file has no Class section. Choose a D&D Friends bot export.");
+    this.resetForNewExport(); this.data=data; this.fileName=fileName; this.sourceText=text; this.classOrder=defaultClassOrder(this.data); await this.render();
+    this.setBusy("Indexing compendiums and world items…"); await resolver.load();
+    this.setBusy("Loading feat data…"); await plutoniumBridge.buildFeatIndex();
+    const allSrc=[...new Set([...resolver.plutoniumSources().map(x=>x.code),...plutoniumBridge.rawFeatSources().map(x=>x.code)])]; if(this.enabledSources===null)this.enabledSources=new Set(allSrc); else this.enabledSources=new Set([...this.enabledSources].filter(x=>allSrc.includes(x))); resolver.setEnabledPlutoniumSources(this.enabledSources);
+    const target=targetId===undefined?this.findExistingActor():(targetId?game.actors?.get(targetId):null);
+    this.targetActorId=target?.id||"";
+    const saved=target?.getFlag?.(MODULE_ID,"choices"); if(saved) this.applySavedChoices(saved);
+    await this.prepareCharacterMetadata(); this.restorePendingSpells();
+    await this.render();
+  }
+  targetActor(){ return this.targetActorId?game.actors?.get(this.targetActorId)||null:null; }
+  targetView(){
+    const cs=this.updateCandidates(); const t=this.targetActor(); const lvl=a=>{ const l=Number(a.system?.details?.level||0); return l?` (level ${l})`:""; };
+    const when=this.savedFrom?.savedAt?new Date(this.savedFrom.savedAt).toLocaleDateString():"";
+    return `<div class="ov-target"><label>Import as <select data-target-actor><option value="">New character</option>${cs.map(a=>`<option value="${esc(a.id)}" ${a.id===this.targetActorId?"selected":""}>Update ${esc(a.name)}${esc(lvl(a))}${a.flags?.[MODULE_ID]?.backupOf?" — backup":""}</option>`).join("")}</select></label>
+      ${t?`<label class="inline-check"><input type="checkbox" data-backup ${this.backup?"checked":""}> Keep a backup copy first</label>
+        <p class="muted">Adds new levels, features, feats, spells and items to ${esc(t.name)} and updates ability scores, gold and item quantities. Nothing already on the sheet is removed.${this.savedFrom?` Choices from the last import${when?` (${esc(when)})`:""} were filled in.`:""}</p>`:""}</div>`;
+  }
+  /** Default database matches for every inventory row, without rendering the Equipment step. */
+  ensureEquipmentMatches(){ const owned=flattenOwned(this.data||{}); owned.forEach((x,i)=>{ if(!this.matches.has(`eq:${i}`)) this.matchSelect(`eq:${i}`,x.name,EQUIP_TYPES,[x.key]); }); }
+  /** Everything the overview needs: what blocks Create, what deserves a look, and what was matched automatically. */
+  importStatus(){
+    const block=[],warn=[],done=[]; if(!this.data) return {block,warn,done};
+    const go=(list,text,step)=>list.push({text,step});
+    // Character
+    const species=this.coreDocs.find(x=>x.kind==="race");
+    if(species) go(done,`Species: ${species.doc?.name||species.name}`,1); else go(warn,`Species “${normalizeSpeciesName(this.data.Race)}” not found`,1);
+    for(const [cn,c] of Object.entries(this.data.Class||{})){
+      const cls=this.coreDocs.find(x=>x.kind==="class"&&x.name===cn); if(cls) go(done,`${cn} ${c.Level}`,1); else go(warn,`Class “${cn}” not found`,1);
+      if(c.Subclass){ const sub=this.coreDocs.find(x=>x.kind==="subclass"&&x.name===c.Subclass); if(sub) go(done,`Subclass: ${sub.doc?.name||c.Subclass}`,1); else go(warn,`Subclass “${c.Subclass}” not found`,1); }
+    }
+    go(done,this.hpOverride?`HP fixed at ${this.hpOverride}`:`HP calculated by Foundry (about ${averageHp(this.data,this.classOrder.length?this.classOrder:undefined,null,this.hitDiceByClass())})`,1);
+    // Choices
+    if(this.skills.length!==2) go(block,`Choose 2 free skill proficiencies (${this.skills.length}/2)`,2); else go(done,`Free skills: ${this.skills.map(s=>SKILLS[s]).join(", ")}`,2);
+    const origin=getOriginFeat(this.data);
+    if(origin){ const u=this.matches.get(`feat:${origin}`); if(!u) go(block,`Choose the Origin feat “${origin}”`,2); else if(u==="__placeholder__") go(warn,`Origin feat “${origin}” will be a placeholder`,2); else go(done,`Origin feat: ${origin}`,2); }
+    for(const d of this.advChoiceDefs){ const have=(this.advChoices.get(d.id)||[]).length, need=this.requiredCount(d);
+      if(have<need) go(block,`${d.sourceName} — ${d.title}: choose ${need-have} more`,2); else if(need) go(done,`${d.sourceName} — ${d.title}`,2);
+      if(need<d.count) go(warn,`${d.sourceName} — ${d.title}: only ${need} of ${d.count} options found; finish on the sheet`,2); }
+    if(!block.some(b=>b.step===2)){ const problem=this.validateChoices(); if(problem) go(block,problem,2); }
+    for(const f of uniqueFeatNames(this.data)){ if(norm(f)===norm(origin)) continue; const u=this.matches.get(`feat:${f}`); if(u==="__placeholder__") go(warn,`Feat “${f}” will be a placeholder`,2); }
+    // Spells
+    for(const [cn,r] of this.spellTally()){ if(cn==="Unassigned") continue; const lim=this.spellLimitsFor(cn);
+      if(!r.c&&!r.l){ if(this.targetActorId) go(done,`${cn}: no new spells chosen (spells already on the sheet are kept)`,3); else go(warn,`${cn}: no spells chosen yet${lim?` (up to ${lim.cantrips??0} cantrips, ${lim.prepared??"?"} prepared)`:""}`,3); }
+      else go(done,lim?`${cn} spells: ${r.c}/${lim.cantrips??0} cantrips, ${r.l}/${lim.prepared??"?"} prepared`:`${cn} spells: ${r.c} cantrips, ${r.l} leveled`,3); }
+    for(const p of this.spellLimitProblems()) go(warn,`Over the spell limits: ${p}`,3);
+    // Equipment
+    this.ensureEquipmentMatches();
+    const owned=flattenOwned(this.data); let matched=0,legacy=0,raw=0;
+    owned.forEach((x,i)=>{ const id=`eq:${i}`, u=this.matches.get(id);
+      if(!u||u==="__placeholder__") go(warn,`${x.name}: no match, will be a placeholder`,4);
+      else if(this.lowConfidence.has(id)) go(warn,`${x.name}: check the match (${this.itemEntryFor(u)?.name||"?"})`,4);
+      else { matched++; if(String(u).startsWith("__rawitem__")) raw++; else if(this.itemEntryFor(u)?.legacy||resolver.excludedEntries.some(e=>e.uuid===u)) legacy++; } });
+    if(owned.length) go(done,`${matched} of ${owned.length} items matched${raw?`, ${raw} from 5etools`:""}${legacy?`, ${legacy} from 2014 sources`:""}${this.remembered.size?`, ${this.remembered.size} from remembered picks`:""}`,4);
+    const t=this.targetActor(); if(t){ const from=Number(t.system?.details?.level||0); go(done,`Updating ${t.name}${from?`: level ${from} → ${this.characterLevel()}`:""}`,0); }
+    go(done,"Resistances, senses, languages and tools are detected from your choices",5);
+    return {block,warn,done};
+  }
+  overviewView(){
+    const {block,warn,done}=this.importStatus();
+    const row=(r,cls)=>r.step===0?`<li class="${cls}"><span>${esc(r.text)}</span></li>`:`<li class="${cls}"><span>${esc(r.text)}</span><button type="button" class="link-button" data-goto-step="${r.step}">${["","Character","Choices","Spells","Equipment","Traits"][r.step]||"Open"} →</button></li>`;
+    const t=this.targetActor(); const verb=t?`Update ${esc(t.name)}`:"Create character";
+    return `<div class="overview">
+      ${this.targetView()}
+      <h3>${block.length?`${block.length} thing${block.length===1?"":"s"} to choose before importing`:"Ready to import"}</h3>
+      ${block.length?`<ul class="ov-list ov-block">${block.map(r=>row(r,"ov-block")).join("")}</ul>`:""}
+      ${this.skills.length!==2?`<div class="ov-skills"><small class="muted">Pick the 2 free skills here:</small><div class="skill-grid">${Object.entries(SKILLS).map(([k,v])=>`<label><input data-skill value="${k}" type="checkbox" ${this.skills.includes(k)?'checked':''} ${!this.skills.includes(k)&&this.skills.length>=2?'disabled':''}> ${v}</label>`).join("")}</div></div>`:""}
+      ${warn.length?`<h4>Worth a look</h4><ul class="ov-list ov-warn ov-warn-list">${warn.map(r=>row(r,"ov-warn")).join("")}</ul>`:""}
+      <details class="ov-done"><summary>Matched automatically (${done.length})</summary><ul class="ov-list">${done.map(r=>row(r,"ov-ok")).join("")}</ul></details>
+      <div class="ov-actions"><button type="button" class="create" data-act="create" ${block.length||this.creating||this.busy?"disabled":""}><i class="fa-solid ${t?"fa-arrows-rotate":"fa-user-plus"}"></i> ${verb}</button><button type="button" data-goto-step="1">Review step by step</button></div>
+      ${block.length?`<p class="muted">Create unlocks when the choices above are made. Everything else can be fixed on the sheet afterwards.</p>`:""}
+    </div>`;
+  }
+  uploadView(){ return `<section><h2>Import Discord Character Export</h2><p>Upload the bot's <code>.json</code> export. Standard JSON and the server bot's Python-style dictionary format are both accepted. Choosing a new file starts a fresh import.</p><span class="upload-links"><button type="button" class="link-button" data-refresh-content title="Re-read compendiums after importing new content">Refresh content</button><button type="button" class="link-button" data-copy-diagnostics title="Copy a report to paste into Discord or a bug report">Copy diagnostics</button></span><label class="drop${this.data?" compact":""}"><i class="fa-solid fa-file-arrow-up"></i><strong>${this.data?esc(this.fileName):"Choose export file"}</strong><input data-file type="file" accept=".json,.txt,application/json,text/plain"></label>${this.data?`<div class="summary"><b>${esc(this.data.Name)}</b><span>Level ${Number(this.data.Level||0)}</span><span>${esc(this.data.Race||"Unknown species")}</span><span>${Object.entries(this.data.Class||{}).map(([k,v])=>`${esc(k)} ${v.Level}${v.Subclass?` (${esc(v.Subclass)})`:""}`).join(" / ")}</span></div>`:""}${this.data&&!this.busy&&this.coreDocs.length?this.overviewView():""}${this.sourceFilterView()}</section>`; }
   coreView(){
-    if(!this.data)return""; const base=baseStats(this.data), eff=effectiveStats(this.data); const avg=averageHp(this.data,this.classOrder.length?this.classOrder:undefined);
+    if(!this.data)return""; const base=baseStats(this.data), eff=effectiveStats(this.data); const avg=averageHp(this.data,this.classOrder.length?this.classOrder:undefined,null,this.hitDiceByClass());
     const speciesOptions=this.speciesCandidates(),selectedSpecies=this.selectedSpeciesEntry();
     const matched=this.coreDocs.filter(x=>x.kind==="class"||x.kind==="subclass").map(x=>`<li><b>${esc(x.name)}</b> → ${esc(x.doc?.name||"?")}${x.kind==="subclass"?` <small>(${esc(x.className)} subclass)</small>`:""}</li>`).join("");
     const missing=Object.entries(this.data.Class||{}).flatMap(([cn,c])=>[...(this.coreDocs.some(x=>x.kind==="class"&&x.name===cn)?[]:[{name:cn,type:"class"}]),...(c.Subclass&&!this.coreDocs.some(x=>x.kind==="subclass"&&x.name===c.Subclass)?[{name:c.Subclass,type:"subclass"}]:[])]);
@@ -1131,10 +1587,16 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
       const l=lim&&lim.prepared!==null?`${r.l}/${lim.prepared} prepared`:`${r.l} spell${r.l===1?"":"s"}`;
       return `${cn}: ${c}, ${l}`; }).join(" · ");
   }
+  /** Index entry for a chosen item: 2024 or 2014 Foundry content, or a 5etools item not yet in Foundry. */
+  itemEntryFor(u){
+    if(!u||u==="__placeholder__"||String(u).startsWith("__scroll__")) return null;
+    if(String(u).startsWith("__rawitem__")){ const it=plutoniumBridge.rawItemById.get(u); if(!it) return null; const e=plutoniumBridge.rawItemEntry(it); const t=code5et(it.type); return {...e,itemTypeValue:{LA:"light",MA:"medium",HA:"heavy",S:"shield"}[t]||""}; }
+    return resolver.entries.find(r=>r.uuid===u)||resolver.excludedEntries.find(r=>r.uuid===u)||null;
+  }
   /** Armor, shields and weapons start equipped; one body armor and one shield at most. */
   defaultEquipment(owned){
     const out=new Map(); let armor=false, shield=false;
-    owned.forEach((x,i)=>{ const u=this.matches.get(`eq:${i}`); const e=u&&!String(u).startsWith("__")?resolver.entries.find(r=>r.uuid===u):null; let equipped=false;
+    owned.forEach((x,i)=>{ const u=this.matches.get(`eq:${i}`); const e=this.itemEntryFor(u); let equipped=false;
       if(e?.type==="weapon") equipped=true;
       else if(e?.type==="equipment"){ const t=norm(e.itemTypeValue); if(["light","medium","heavy"].includes(t)){ equipped=!armor; armor=true; } else if(t==="shield"){ equipped=!shield; shield=true; } else equipped=x.category==="Magic Item"; }
       out.set(`eq:${i}`,{equipped,attuned:x.attuned,qty:x.qty}); });
@@ -1143,7 +1605,7 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
   equipState(i,x,defaults){ const id=`eq:${i}`; return {...(defaults?.get(id)||{equipped:false,attuned:x.attuned,qty:x.qty}),...(this.equipment.get(id)||{})}; }
   equipView(){
     if(!this.data)return""; const owned=flattenOwned(this.data);
-    const html=owned.map((x,i)=>{ const id=`eq:${i}`; const sel=this.matchSelect(id,x.name,["equipment","weapon","consumable","loot","tool","container"]); return {i,x,id,sel,low:this.lowConfidence.has(id)}; });
+    const html=owned.map((x,i)=>{ const id=`eq:${i}`; const sel=this.matchSelect(id,x.name,EQUIP_TYPES,[x.key]); return {i,x,id,sel,low:this.lowConfidence.has(id)}; });
     const defaults=this.defaultEquipment(owned);
     const rows=html.sort((a,b)=>(b.low-a.low)||(a.i-b.i)).map(({i,x,id,sel,low})=>{ const st=this.equipState(i,x,defaults); return `<div class="equip ${low?'needs-check':''}"><div><b>${esc(x.name)}</b><small>${x.category}${low?' · check match':''}${x.qty===0?' · used up':''}</small></div>${sel}<label>Qty <input data-eq-qty="${id}" type="number" min="0" value="${st.qty}"></label><label><input data-eq-equipped="${id}" type="checkbox" ${st.equipped?'checked':''}> Equipped</label>${x.attunement||x.attuned?`<label><input data-eq-attuned="${id}" type="checkbox" ${st.attuned?'checked':''}> Attuned</label>`:'<span></span>'}</div>`; }).join("");
     const lows=html.filter(r=>r.low).length;
@@ -1151,7 +1613,7 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
   }
   reviewView(){
     if(!this.data)return"";
-    const hp=Number(this.hpOverride)||averageHp(this.data,this.classOrder.length?this.classOrder:undefined), base=baseStats(this.data);
+    const hp=Number(this.hpOverride)||averageHp(this.data,this.classOrder.length?this.classOrder:undefined,null,this.hitDiceByClass()), base=baseStats(this.data);
     const owned=flattenOwned(this.data); const eqName=k=>owned[Number(k.slice(3))]?.name||k;
     const placeholders=[...this.matches.entries()].filter(([,v])=>v==="__placeholder__").map(([k])=>k.startsWith("eq:")?eqName(k):k.replace(/^feat:/,""));
     const lows=[...this.lowConfidence].filter(k=>this.matches.get(k)!=="__placeholder__").map(eqName);
@@ -1167,7 +1629,7 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
       ${groupSummary}<div class="review-section"><h4>Other Feats</h4><p>${otherFeats.map(featLabel).join(", ")||"None"}</p></div>
       <div class="review-section"><h4>Spellcasting</h4>${[...this.casterProfiles.entries()].map(([cn,p])=>`<p><b>${esc(cn)}:</b> level ${Number(p.casterLevel||0)}, ${esc(p.progression)} progression${p.via?` via ${esc(p.via)}`:""}, ${esc(String(p.ability||"").toUpperCase())}, max spell level ${p.maxOverride!==""?Number(p.maxOverride):maxSpellLevelForProgression(p.progression,p.casterLevel)}</p>`).join("")}<p>${esc(this.spellCountsText())}; ${this.grantedSpells.size} granted subclass spell(s).</p>${this.spellLimitProblems().length?`<div class="warning"><b>Over the spell limits:</b> ${this.spellLimitProblems().map(esc).join("; ")}.</div>`:""}</div>
       <div class="review-section"><h4>Final Traits</h4><p><b>Resistances:</b> ${[...this.finalTraits.dr].join(", ")||"None"}</p><p><b>Damage Immunities:</b> ${[...this.finalTraits.di].join(", ")||"None"}</p><p><b>Condition Immunities:</b> ${[...this.finalTraits.ci].join(", ")||"None"}</p><p><b>Languages:</b> ${esc(langs)||"None"}</p><p><b>Tools:</b> ${[...this.finalTraits.tools].map(toolLabel).join(", ")||"None"}</p></div>
-      <div class="review-section"><h4>Owner</h4><select data-owner><option value="">GM only</option>${users.map(u=>`<option value="${esc(u.id)}" ${this.ownerId===u.id?'selected':''}>${esc(u.name)}</option>`).join("")}</select><p class="muted">The selected player gets Owner permission on the new actor.</p></div>
+      ${game.user.isGM?`<div class="review-section"><h4>Owner</h4><select data-owner><option value="">GM only</option>${users.map(u=>`<option value="${esc(u.id)}" ${this.ownerId===u.id?'selected':''}>${esc(u.name)}</option>`).join("")}</select><p class="muted">The selected player gets Owner permission on the new actor.</p></div>`:""}
       ${placeholders.length?`<div class="warning"><b>${placeholders.length} placeholder(s)</b> will be created: ${placeholders.map(esc).join(", ")}.</div>`:""}
       ${lows.length?`<div class="warning"><b>Low-confidence matches:</b> ${lows.map(esc).join(", ")}. Go back to Equipment to confirm them.</div>`:""}
       ${incomplete.length?`<div class="warning"><b>Choices to finish by hand after import:</b> ${incomplete.map(d=>`${esc(d.sourceName)} — ${esc(d.title)}`).join("; ")}.</div>`:""}
@@ -1175,18 +1637,34 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
   }
   matchRow(id,name,types){ return `<div class="match-row ${this.lowConfidence.has(id)?'needs-check':''}"><b>${esc(name)}</b>${this.matchSelect(id,name,types)}</div>`; }
   /** Candidate list, also trying common magic-item spellings ("Longsword +1" vs "+1 Longsword" vs "Weapon, +1"). */
-  matchCandidates(name,types){
-    const variants=[name]; const m=/^\s*\+(\d)\s+(.+)$/.exec(name)||/^(.+?),?\s*\+(\d)\s*$/.exec(name);
+  matchCandidates(name,types,alts=[]){
+    const variants=[name,...alts.filter(a=>a&&norm(a)!==norm(name))]; const m=/^\s*\+(\d)\s+(.+)$/.exec(name)||/^(.+?),?\s*\+(\d)\s*$/.exec(name);
     if(m){ const bonus=/^\s*\+/.test(name)?m[1]:m[2], base=/^\s*\+/.test(name)?m[2]:m[1]; variants.push(`+${bonus} ${base}`,`${base} +${bonus}`,`${base}, +${bonus}`); }
-    const best=new Map(); for(const v of variants) for(const c of resolver.candidates(v,types)){ const prev=best.get(c.uuid); if(!prev||c.score>prev.score) best.set(c.uuid,c); }
-    return [...best.values()].sort((a,b)=>(b.score-a.score)||(resolver.priority(b)-resolver.priority(a))).slice(0,8);
+    const physical=types.some(t=>PHYSICAL_TYPES.has(t));
+    const best=new Map(); for(const v of variants) for(const c of (physical?resolver.itemCandidates(v,types):resolver.candidates(v,types))){ const prev=best.get(c.uuid); if(!prev||c.score>prev.score) best.set(c.uuid,c); }
+    if(physical){
+      // Items Plutonium knows about but nobody has imported into Foundry yet. Skip names already available in Foundry.
+      const have=new Set([...best.values()].map(c=>norm(c.name)));
+      for(const v of variants) for(const c of plutoniumBridge.rawItemCandidates(v)){ if(have.has(norm(c.name))) continue; const prev=best.get(c.uuid); if(!prev||c.score>prev.score) best.set(c.uuid,c); }
+    }
+    const rank=c=>c.rawItem?1:c.legacy?2:3;
+    return [...best.values()].sort((a,b)=>(Math.round(b.score*100)-Math.round(a.score*100))||(rank(b)-rank(a))||(resolver.priority(b)-resolver.priority(a))).slice(0,10);
   }
   get lowConfidence(){ if(!this._low)this._low=new Set(); return this._low; }
-  matchSelect(id,name,types){
-    const cs=this.matchCandidates(name,types); const inner=spellScrollInnerName(name); const sp=inner?resolver.best(inner,["spell"]):null; const scrollVal=sp?`__scroll__:${sp.uuid}`:null;
+  matchLabel(c){ const src=c.plutonium?.source||c.source?.book||""; return `${c.name}${c.rawItem?` — create from 5etools${src?` (${src})`:""}`:c.legacy?` (2014${src?` · ${src}`:""})`:""}${c.score<1?` (${Math.round(c.score*100)}%)`:""}`; }
+  /** A remembered match for this item name that still exists in this world, or null. */
+  rememberedMatch(name,types=[]){
+    const m=itemMemory.get(name); const u=m?.uuid; if(!u) return null;
+    if(String(u).startsWith("__rawitem__")) return plutoniumBridge.rawItemById?.has(u)?{uuid:u,label:m.label}:null;
+    const e=resolver.entries.find(x=>x.uuid===u)||resolver.excludedEntries.find(x=>x.uuid===u);
+    return e&&(!types.length||types.includes(e.type))?{uuid:u,label:m.label||e.name,entry:e}:null;
+  }
+  matchSelect(id,name,types,alts=[]){
+    const cs=this.matchCandidates(name,types,alts);
+    if(!this.matches.has(id)&&id.startsWith("eq:")){ const mem=this.rememberedMatch(name,types); if(mem){ this.matches.set(id,mem.uuid); this.remembered.add(id); if(!cs.some(c=>c.uuid===mem.uuid)) cs.unshift({...(mem.entry||{}),uuid:mem.uuid,name:mem.label||name,score:1}); } } const inner=spellScrollInnerName(name); const sp=inner?resolver.best(inner,["spell"]):null; const scrollVal=sp?`__scroll__:${sp.uuid}`:null;
     const chosen=this.matches.get(id) || scrollVal || cs[0]?.uuid || "__placeholder__"; this.matches.set(id,chosen);
-    const top=cs.find(c=>c.uuid===chosen); if(top&&top.score<MATCH_CONFIDENT&&!this.confirmed?.has(id)) this.lowConfidence.add(id); else this.lowConfidence.delete(id);
-    return `<select data-match="${esc(id)}"><option value="__placeholder__" ${chosen==='__placeholder__'?'selected':''}>Create placeholder</option>${scrollVal?`<option value="${esc(scrollVal)}" ${chosen===scrollVal?'selected':''}>Create native Spell Scroll from ${esc(sp.name)}</option>`:""}${cs.map(c=>`<option value="${esc(c.uuid)}" ${chosen===c.uuid?'selected':''}>${esc(c.name)}${c.score<1?` (${Math.round(c.score*100)}%)`:""}</option>`).join("")}</select>`;
+    const top=cs.find(c=>c.uuid===chosen); if(top&&top.score<MATCH_CONFIDENT&&!this.confirmed?.has(id)&&!this.remembered.has(id)) this.lowConfidence.add(id); else this.lowConfidence.delete(id);
+    return `<select data-match="${esc(id)}"><option value="__placeholder__" ${chosen==='__placeholder__'?'selected':''}>Create placeholder</option>${scrollVal?`<option value="${esc(scrollVal)}" ${chosen===scrollVal?'selected':''}>Create native Spell Scroll from ${esc(sp.name)}</option>`:""}${cs.map(c=>`<option value="${esc(c.uuid)}" ${chosen===c.uuid?'selected':''}>${esc(this.matchLabel(c))}</option>`).join("")}</select>`;
   }
   validateChoices(){
     if(this.skills.length!==2) return "Select exactly two free skill proficiencies.";
@@ -1203,14 +1681,15 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
     return "";
   }
   async bind(root){
-    root.querySelector("[data-file]")?.addEventListener("change",async e=>{ const f=e.target.files[0]; if(!f)return; try{
-      const data=parseBotExport(await f.text()); if(!data||typeof data!=="object"||!Object.keys(data.Class||{}).length) throw new Error("This file has no Class section. Choose a D&D Friends bot export.");
-      this.resetForNewExport(); this.data=data; this.fileName=f.name; this.classOrder=defaultClassOrder(this.data); await this.render();
-      this.setBusy("Indexing compendiums and world items…"); await resolver.load(true);
-      this.setBusy("Loading feat data…"); await plutoniumBridge.buildFeatIndex();
-      const allSrc=[...new Set([...resolver.plutoniumSources().map(x=>x.code),...plutoniumBridge.rawFeatSources().map(x=>x.code)])]; if(this.enabledSources===null)this.enabledSources=new Set(allSrc); else this.enabledSources=new Set([...this.enabledSources].filter(x=>allSrc.includes(x))); resolver.setEnabledPlutoniumSources(this.enabledSources);
-      await this.prepareCharacterMetadata(); await this.render();
-    }catch(err){console.error(err);this.setBusy("");ui.notifications.error(`Could not read export: ${err.message}`);} });
+    root.querySelector("[data-file]")?.addEventListener("change",async e=>{ const f=e.target.files[0]; if(!f)return; try{ await this.loadExport(await f.text(),f.name); }
+      catch(err){ console.error(err); logImportError("Reading export",err); this.setBusy(""); ui.notifications.error(`Could not read export: ${err.message}`); } });
+    root.querySelector("[data-copy-diagnostics]")?.addEventListener("click",()=>copyDiagnostics(this));
+    root.querySelector("[data-target-actor]")?.addEventListener("change",async e=>{ if(this.busy) return; const id=e.target.value;
+      try{ const t=id?game.actors?.get(id):null;
+        // A character with saved choices reloads them; otherwise keep what has been chosen so far.
+        if(t?.getFlag?.(MODULE_ID,"choices")) await this.loadExport(this.sourceText,this.fileName,{targetId:id}); else { this.targetActorId=id; await this.render(); } }
+      catch(err){ console.error(err); logImportError("Switching import target",err); this.setBusy(""); ui.notifications.error(err.message); } });
+    root.querySelector("[data-backup]")?.addEventListener("change",e=>{ this.backup=e.target.checked; });
     root.querySelector("[data-source-search]")?.addEventListener("input",e=>{ this.sourceSearch=e.target.value||""; const q=norm(this.sourceSearch); root.querySelectorAll("[data-source-row]").forEach(r=>r.style.display=!q||r.dataset.sourceRow.includes(q)?"":"none"); });
     const sourcesChanged=async()=>{ resolver.setEnabledPlutoniumSources(this.enabledSources); const s=root.querySelector(".source-filter summary small"); if(s) s.textContent=`${this.enabledSources.size}/${root.querySelectorAll("[data-source-code]").length} enabled`; if(this.data) await this.prepareCharacterMetadata(); };
     root.querySelectorAll("[data-source-code]").forEach(c=>c.addEventListener("change",async e=>{ if(this.enabledSources===null)this.enabledSources=new Set([...resolver.plutoniumSources(),...plutoniumBridge.rawFeatSources()].map(x=>x.code)); e.target.checked?this.enabledSources.add(e.target.value):this.enabledSources.delete(e.target.value); await sourcesChanged(); }));
@@ -1233,7 +1712,13 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
       else if(a==="apply-caster"){await this.rerender();}
       else if(a==="clear-spells"){this.spells.clear();root.querySelectorAll("[data-spell]").forEach(x=>x.checked=false);const count=root.querySelector("[data-spell-counts]");if(count){count.textContent=this.spellCountsText();count.classList.remove("over");}}
       else if(a==="create") await this.createActor(b);
+      else if(a==="overview"){ this.step=0; await this.render(); }
     }));
+    root.querySelectorAll("[data-goto-step]").forEach(b=>b.addEventListener("click",async()=>{ if(this.busy) return; const to=Number(b.dataset.gotoStep);
+      if(to>=2&&this.step<2&&!this.advChoiceDefs.length) await this.prepareCharacterMetadata();
+      if(to===5){ this.setBusy("Detecting traits…"); try{ await this.refreshDetectedTraits(); } finally { this.setBusy(""); } }
+      this.step=to; await this.render(); }));
+    root.querySelector("[data-refresh-content]")?.addEventListener("click",async()=>{ if(this.busy) return; this.setBusy("Re-reading compendiums…"); try{ await resolver.load(true); await plutoniumBridge.buildFeatIndex(true); await plutoniumBridge.buildItemIndex(true); await plutoniumBridge.buildSpellClassMap(true); if(this.data) await this.prepareCharacterMetadata(); } finally { this.setBusy(""); } await this.render(); });
     const hpInput=root.querySelector("[data-hp]"); if(hpInput){ if(this.hpOverride==="")hpInput.value=""; hpInput.addEventListener("input",e=>this.hpOverride=e.target.value); }
     root.querySelector("[data-feat-bonuses-included]")?.addEventListener("change",async e=>{ Object.defineProperty(this.data,"__featBonusesInStats",{value:e.target.checked,enumerable:false,writable:true,configurable:true}); await this.rerender(); });
     root.querySelector("[data-start-class]")?.addEventListener("change",async e=>{ this.classOrder=this.orderStartingWith(e.target.value); await this.prepareCharacterMetadata(); await this.rerender(); });
@@ -1256,6 +1741,7 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
       if(!e.target.checked)this.skills=this.skills.filter(x=>x!==v);
       // Update disabled states in place; re-rendering resets scroll position in Foundry v14.
       root.querySelectorAll("[data-skill]").forEach(x=>x.disabled=!x.checked&&this.skills.length>=2);
+      if(this.step===0&&this.skills.length===2) this.render();  // refresh the overview once both are picked
     }));
     const featChanged=async()=>{ this.setBusy("Loading feat choices…"); try{ await this.rebuildChoiceDefs(); await this.rebuildFeaturePlacementDefs(); } finally { this.setBusy(""); } await this.rerender(); };
     root.querySelectorAll("[data-match]").forEach(s=>s.addEventListener("change",async e=>{ const id=e.target.dataset.match; this.matches.set(id,e.target.value); (this.confirmed??=new Set()).add(id); this.lowConfidence.delete(id); e.target.closest(".needs-check")?.classList.remove("needs-check"); if(id.startsWith("feat:")) await featChanged(); else if(id.startsWith("eq:")){ const i=Number(id.slice(3)); const st=this.equipment.get(id)||{}; if(!("equipped" in st)){ const d=this.defaultEquipment(flattenOwned(this.data)).get(id); this.updateEq(id,{equipped:d?.equipped??false}); const box=root.querySelector(`[data-eq-equipped="${CSS.escape(id)}"]`); if(box) box.checked=!!this.equipment.get(id).equipped; } } }));
@@ -1298,7 +1784,7 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
     root.querySelectorAll("[data-eq-attuned]").forEach(i=>i.addEventListener("change",e=>this.updateEq(e.target.dataset.eqAttuned,{attuned:e.target.checked})));
   }
   updateEq(id,patch){this.equipment.set(id,{...(this.equipment.get(id)||{}),...patch});}
-  async docData(uuid){ if(!uuid||uuid==="__placeholder__")return null; if(String(uuid).startsWith("__rawfeat__"))return plutoniumBridge.rawFeatToItemData(uuid); try{const d=await fromUuid(uuid); return d?.toObject?.()||null;}catch(_){return null;} }
+  async docData(uuid){ if(!uuid||uuid==="__placeholder__")return null; if(String(uuid).startsWith("__rawfeat__"))return plutoniumBridge.rawFeatToItemData(uuid); if(String(uuid).startsWith("__rawitem__"))return plutoniumBridge.rawItemToItemData(uuid); try{const d=await fromUuid(uuid); return d?.toObject?.()||null;}catch(_){return null;} }
   async nativeScrollData(value,qty=1){
     if(!String(value||"").startsWith("__scroll__:")) return null;
     const uuid=String(value).slice("__scroll__:".length); const spell=await getDoc(uuid); if(!spell)return null;
@@ -1340,7 +1826,13 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
     }
     return this.docData(uuid);
   }
-  placeholder(name,type="loot",qty=1){return {name,type,img:"icons/svg/item-bag.svg",system:{quantity:qty,description:{value:`<p>Placeholder created by D&D Friends Character Importer. Original export name: <b>${esc(name)}</b>.</p>`},source:{custom:"D&D Friends Character Importer",rules:"2024"}}};}
+  placeholder(name,type="loot",qty=1,raw=null){
+    const sys={quantity:qty,description:{value:`<p>Placeholder created by D&D Friends Character Importer. Original export name: <b>${esc(name)}</b>.</p>`},source:{custom:"D&D Friends Character Importer",rules:"2024"}};
+    // Keep what the export knows: rarity and attunement (magic item placeholders become equipment so attunement works).
+    if(raw&&typeof raw==="object"){ const r=rarityKey(raw.Rarity); if(r) sys.rarity=r; if(raw.Attunement){ sys.attunement="required"; sys.attuned=raw.Attuned===true; }
+      if(type==="equipment") sys.type={value:equipmentMiscType("wondrous")}; }
+    return {name,type,img:"icons/svg/item-bag.svg",system:sys};
+  }
   magicInitiateVariantUuid(baseUuid){
     const base=resolver.entries.find(e=>e.uuid===baseUuid); if(originChoiceCanonicalName(base?.name||"")!=="Magic Initiate") return baseUuid;
     const list=norm(this.magicInitiateList||"wizard");
@@ -1381,21 +1873,85 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
     return {embeds,updates,warnings,unresolved};
   }
   /** Populate each class's HitPoints advancement so Foundry derives HP (and adds Tough, CON changes, level-ups). */
+  async backupActor(actor){
+    const data=actor.toObject(); delete data._id; data.name=`${actor.name} (backup ${new Date().toLocaleDateString()})`;
+    data.flags=data.flags||{}; data.flags[MODULE_ID]={...(data.flags[MODULE_ID]||{}),backupOf:actor.id}; delete data.flags[MODULE_ID].choices;
+    return Actor.implementation.create(data);
+  }
+  /**
+   * Update mode: new items are created; class levels and item quantities are updated in place; species, subclasses,
+   * features, feats and spells already on the sheet are left untouched. Returns what still needs creating.
+   */
+  async mergeIntoActor(actor,embeds,fixedHp,startClass){
+    const key=d=>`${d.type}:${norm(d.name)}`; const items=[...actor.items];
+    const have=new Map(); for(const it of items){ const k=key(it); if(!have.has(k)) have.set(k,it); }
+    const create=[], updates=[], summary={added:[],levels:[],qty:[],notInExport:[]};
+    for(const d of embeds){
+      const ident=d.system?.identifier;
+      const ex=have.get(key(d))||(ident&&["class","subclass"].includes(d.type)?items.find(i=>i.type===d.type&&i.system?.identifier===ident):null);
+      if(!ex){ create.push(d); summary.added.push(`${d.name}${d.type==="class"?` ${d.system?.levels||""}`:""}`); continue; }
+      if(d.type==="class"){
+        const from=Number(ex.system?.levels||0), to=Number(d.system?.levels||0); if(to===from) continue;
+        const obj=ex.toObject(); foundry.utils.setProperty(obj,"system.levels",to);
+        if(!fixedHp){ // keep the HP already rolled or chosen for earlier levels
+          const old=Object.fromEntries(advancementList(ex.toObject()).filter(a=>a?.type==="HitPoints").map(a=>[a._id,a.value||{}]));
+          this.applyHitPointAdvancement(obj,to,norm(d.name)===startClass);
+          for(const a of advancementList(obj)) if(a?.type==="HitPoints") a.value={...a.value,...Object.fromEntries(Object.entries(old[a._id]||{}).filter(([l])=>Number(l)<=to))};
+        }
+        updates.push({_id:ex.id,"system.levels":to,"system.advancement":obj.system.advancement}); summary.levels.push(`${ex.name} ${from} → ${to}`); continue;
+      }
+      if(PHYSICAL_TYPES.has(d.type)){ const q=Number(d.system?.quantity||1), oq=Number(ex.system?.quantity||1); if(q!==oq){ updates.push({_id:ex.id,"system.quantity":q}); summary.qty.push(`${ex.name}: ${oq} → ${q}`); } }
+    }
+    if(updates.length) await Item.implementation.updateDocuments(updates,{parent:actor});
+    const inExport=new Set(embeds.filter(d=>PHYSICAL_TYPES.has(d.type)).map(key));
+    summary.notInExport=items.filter(i=>PHYSICAL_TYPES.has(i.type)&&i.flags?.[MODULE_ID]?.fromExport&&!inExport.has(key(i))).map(i=>i.name);
+    return {create,summary};
+  }
+  /** Update mode never lowers a proficiency, removes a trait or shrinks a sense. */
+  mergeWithExisting(actor,updates){
+    const src=actor.toObject?actor.toObject():actor;
+    for(const [k,v] of Object.entries(updates)){
+      const cur=foundry.utils.getProperty(src,k);
+      if(typeof v==="number"&&typeof cur==="number") updates[k]=Math.max(cur,v);
+      else if(Array.isArray(v)&&cur&&typeof cur!=="string") updates[k]=[...new Set([...(cur instanceof Set?[...cur]:Array.isArray(cur)?cur:[]),...v])];
+      else if(v===null&&cur!=null) delete updates[k];
+    }
+    if(foundry.utils.getProperty(src,"system.details.originalClass")) delete updates["system.details.originalClass"];
+    return updates;
+  }
   applyHitPointAdvancement(d,levels,isStartingClass){
     for(const adv of advancementList(d)){ if(adv?.type!=="HitPoints") continue; const value={}; for(let l=1;l<=levels;l++) value[String(l)]=(l===1&&isStartingClass)?"max":"avg"; adv.value=value; }
   }
   async createActor(button){
-    if(this.creating) return; this.creating=true; if(button) button.disabled=true;
-    let actor=null;
+    if(this.creating) return;
+    const problem=this.validateChoices(); if(problem){ ui.notifications.warn(problem); return; }
+    this.creating=true; if(button) button.disabled=true;
+    this.ensureEquipmentMatches(); try{ await this.refreshDetectedTraits(); }catch(e){ console.warn(`${MODULE_ID} trait detection failed`,e); }
+    let actor=null; const target=this.targetActor(); const updating=!!target; let backup=null, summary=null;
+    if(this.targetActorId&&!target){ ui.notifications.error("The character to update no longer exists. Choose it again or import as a new character."); this.creating=false; if(button) button.disabled=false; return; }
     try{
-      this.setBusy("Creating character…");
+      this.setBusy(updating?`Updating ${target.name}…`:"Creating character…");
       const owned=flattenOwned(this.data);
       const placeholderMagic=new Set(owned.map((x,i)=>x.category==="Magic Item"&&(!this.matches.get(`eq:${i}`)||this.matches.get(`eq:${i}`)==="__placeholder__")?x.key:null).filter(Boolean));
       // Matched magic items apply their own active effects; only placeholder items fall back to the bot's stat bonus.
       const stats=effectiveStats(this.data,key=>placeholderMagic.has(key));
       const fixedHp=Number(this.hpOverride)||0;
-      const ownership={default:0}; if(this.ownerId) ownership[this.ownerId]=CONST.DOCUMENT_OWNERSHIP_LEVELS.OWNER;
-      actor=await Actor.implementation.create({name:this.data.Name,type:"character",ownership,system:{abilities:Object.fromEntries(ABILITIES.map(a=>[a,{value:stats[a]}])),currency:{gp:Number(this.data.GP||0)},attributes:{hp:{value:fixedHp||1,max:fixedHp||null,temp:0,tempmax:0}},details:{alignment:"",background:null}},flags:{[MODULE_ID]:{sourceFile:this.fileName,rawExport:this.data,classOrder:this.classOrder}}});
+      // Explicit ownership replaces Foundry's default, so always keep the importing user as owner;
+      // otherwise a player could not add items to the actor they just created.
+      const OWNER=CONST.DOCUMENT_OWNERSHIP_LEVELS.OWNER; const ownership={default:0}; if(game.user?.id) ownership[game.user.id]=OWNER; if(this.ownerId) ownership[this.ownerId]=OWNER;
+      const history=entry=>[...((target?.getFlag?.(MODULE_ID,"history"))||[]),entry].slice(-10);
+      const histEntry={at:Date.now(),file:this.fileName,level:this.characterLevel(),mode:updating?"update":"create",by:game.user?.name||"",module:moduleVersion()};
+      let oldHp=null;
+      if(updating){
+        actor=target; oldHp={value:Number(actor.system?.attributes?.hp?.value)||0,max:Number(actor.system?.attributes?.hp?.max)||0};
+        if(this.backup){ this.setBusy("Saving a backup copy…"); backup=await this.backupActor(actor); this.setBusy(`Updating ${actor.name}…`); }
+        const up={"system.currency.gp":Number(this.data.GP||0)}; for(const a of ABILITIES) up[`system.abilities.${a}.value`]=stats[a];
+        if(fixedHp) up["system.attributes.hp.max"]=fixedHp;
+        await actor.unsetFlag?.(MODULE_ID,"rawExport");
+        up[`flags.${MODULE_ID}.sourceFile`]=this.fileName; up[`flags.${MODULE_ID}.rawExport`]=this.data; up[`flags.${MODULE_ID}.classOrder`]=this.classOrder; up[`flags.${MODULE_ID}.history`]=history(histEntry);
+        await actor.update(up);
+      } else
+      actor=await Actor.implementation.create({name:this.data.Name,type:"character",ownership,system:{abilities:Object.fromEntries(ABILITIES.map(a=>[a,{value:stats[a]}])),currency:{gp:Number(this.data.GP||0)},attributes:{hp:{value:fixedHp||1,max:fixedHp||null,temp:0,tempmax:0}},details:{alignment:"",background:null}},flags:{[MODULE_ID]:{sourceFile:this.fileName,rawExport:this.data,classOrder:this.classOrder,history:history(histEntry)}}});
       const embeds=[]; const warnings=[];
       const startClass=norm(this.classOrder[0]||Object.keys(this.data.Class||{})[0]||"");
       // Species, classes and subclasses: reuse the documents matched on the Core step.
@@ -1424,7 +1980,8 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
         d.flags=d.flags||{};d.flags[MODULE_ID]={...(d.flags[MODULE_ID]||{}),spellcastingClass:cn||null,spellcastingAbility:p?.ability||null};embeds.push(d);}
       // Equipment: merge duplicate items by adding quantities; skip items with nothing left.
       const defaults=this.defaultEquipment(owned);
-      for(let i=0;i<owned.length;i++){const x=owned[i],id=`eq:${i}`,u=this.matches.get(id),state=this.equipState(i,x,defaults); if(Number(state.qty)<=0) continue; let d=String(u||"").startsWith("__scroll__:")?await this.nativeScrollData(u,state.qty):await this.docData(u);if(!d){d=this.placeholder(x.name,x.category==="Consumable"?"consumable":"loot",state.qty);warnings.push(`Item placeholder: ${x.name}`);} foundry.utils.setProperty(d,"system.quantity",Number(state.qty)||1); if(foundry.utils.hasProperty(d,"system.equipped"))foundry.utils.setProperty(d,"system.equipped",!!state.equipped); if(foundry.utils.hasProperty(d,"system.attuned"))foundry.utils.setProperty(d,"system.attuned",!!state.attuned); embeds.push(d);}
+      for(let i=0;i<owned.length;i++){const x=owned[i],id=`eq:${i}`,u=this.matches.get(id),state=this.equipState(i,x,defaults); if(Number(state.qty)<=0) continue; let d=String(u||"").startsWith("__scroll__:")?await this.nativeScrollData(u,state.qty):await this.docData(u);if(!d){d=this.placeholder(x.name,x.category==="Consumable"?"consumable":x.category==="Magic Item"?"equipment":"loot",state.qty,x.raw);warnings.push(`Item placeholder: ${x.name}`);} else if(d?.flags?.[MODULE_ID]?.rawItemFallback){warnings.push(`Created from 5etools text, check its mechanics: ${d.name}`);} foundry.utils.setProperty(d,"system.quantity",Number(state.qty)||1); // Converted 5etools items may omit these fields, so set them on every physical item.
+        if(PHYSICAL_TYPES.has(d.type)||foundry.utils.hasProperty(d,"system.equipped"))foundry.utils.setProperty(d,"system.equipped",!!state.equipped); if(foundry.utils.hasProperty(d,"system.attuned")||d.system?.attunement)foundry.utils.setProperty(d,"system.attuned",!!state.attuned); d.flags=d.flags||{}; d.flags[MODULE_ID]={...(d.flags[MODULE_ID]||{}),fromExport:true}; embeds.push(d);}
       const deduped=[]; const byKey=new Map();
       for(const d of embeds){
         const owner=d?.flags?.[MODULE_ID]?.owner||"";
@@ -1434,8 +1991,10 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
         byKey.set(k,d); deduped.push(d);
       }
       for(const d of deduped){delete d._id;delete d.folder;delete d.ownership;delete d.sort;delete d._stats;}
-      this.setBusy(`Adding ${deduped.length} items…`);
-      const created=deduped.length?await Item.implementation.createDocuments(deduped,{parent:actor}):[];
+      let toCreate=deduped;
+      if(updating){ this.setBusy("Comparing with the sheet…"); const res=await this.mergeIntoActor(actor,deduped,fixedHp,startClass); toCreate=res.create; summary=res.summary; }
+      this.setBusy(`Adding ${toCreate.length} items…`);
+      const created=toCreate.length?await Item.implementation.createDocuments(toCreate,{parent:actor}):[];
       // Display-only feature placement against the local species/class/subclass documents.
       const parents={species:actor.items.find(i=>i.type==="race"),class:actor.items.find(i=>i.type==="class"&&norm(i.name)===startClass),subclass:actor.items.find(i=>i.type==="subclass")};
       const firstGrantId=doc=>{const a=advancementEntries(doc,99,true).find(x=>x.type==="ItemGrant");return a?._id||"cbiPlacement";}; const placementUpdates=[];
@@ -1459,20 +2018,32 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
       for(const [sense,val] of Object.entries(this.finalTraits.senses)){const n=Number(val);updates[`system.attributes.senses.ranges.${sense}`]=Number.isFinite(n)&&n>0?n:null;if(sense==="darkvision"&&n>0)darkvision=n;}
       const startItem=actor.items.find(i=>i.type==="class"&&norm(i.name)===startClass); if(startItem) updates["system.details.originalClass"]=startItem.id;
       if(darkvision){ updates["prototypeToken.sight.range"]=darkvision; updates["prototypeToken.sight.visionMode"]="darkvision"; }
+      if(updating) this.mergeWithExisting(actor,updates);
       await actor.update(updates);
       // Fill every spell slot, then set current HP to the calculated (or fixed) maximum.
-      actor.prepareData(); const slotUpdates={}; for(const [k,v] of Object.entries(actor.system?.spells||{})){const max=Number(v?.max);if(Number.isFinite(max)&&max>0)slotUpdates[`system.spells.${k}.value`]=max;}
-      const maxHp=Number(actor.system?.attributes?.hp?.max)||fixedHp||1; slotUpdates["system.attributes.hp.value"]=maxHp;
+      actor.prepareData(); const slotUpdates={};
+      if(updating){ // keep current HP and slots; add any increase in maximum HP to current HP
+        const newMax=Number(actor.system?.attributes?.hp?.max)||fixedHp||oldHp.max||1; slotUpdates["system.attributes.hp.value"]=Math.max(0,Math.min(newMax,oldHp.value+Math.max(0,newMax-oldHp.max)));
+      } else {
+        for(const [k,v] of Object.entries(actor.system?.spells||{})){const max=Number(v?.max);if(Number.isFinite(max)&&max>0)slotUpdates[`system.spells.${k}.value`]=max;}
+        slotUpdates["system.attributes.hp.value"]=Number(actor.system?.attributes?.hp?.max)||fixedHp||1;
+      }
       await actor.update(slotUpdates);
+      // Save every choice for the next import of this character, and remember hand-picked item matches for everyone.
+      try{ await actor.unsetFlag?.(MODULE_ID,"choices"); await actor.setFlag(MODULE_ID,"choices",this.snapshotChoices()); }catch(e){ console.warn(`${MODULE_ID} | could not save import choices`,e); logImportError("Saving import choices",e); }
+      try{ await itemMemory.remember([...this.confirmed].filter(id=>id.startsWith("eq:")).map(id=>{ const x=owned[Number(id.slice(3))]; const u=this.matches.get(id); return {name:x?.name,uuid:u,label:this.itemEntryFor(u)?.name||""}; })); }catch(e){ console.warn(`${MODULE_ID} | could not remember item matches`,e); }
       await actor.sheet?.render(true);
       const followUp=[...warnings,...nativeAdv.unresolved];
-      ui.notifications[followUp.length?"warn":"info"](followUp.length?`Created ${actor.name}. ${followUp.length} item(s) need review.`:`Created ${actor.name}.`);
-      if(followUp.length) await foundry.applications.api.DialogV2.prompt({window:{title:"Import Review"},content:`<div><p>The actor was created. These items still need attention on the sheet:</p><ul>${followUp.map(w=>`<li>${esc(w)}</li>`).join("")}</ul><p>Everything else chosen in the wizard was applied.</p></div>`,ok:{label:"Done"}});
+      const did=updating?"Updated":"Created";
+      ui.notifications[followUp.length?"warn":"info"](followUp.length?`${did} ${actor.name}. ${followUp.length} item(s) need review.`:`${did} ${actor.name}.`);
+      const list=(title,arr)=>arr?.length?`<p><b>${title}</b></p><ul>${arr.map(w=>`<li>${esc(w)}</li>`).join("")}</ul>`:"";
+      if(updating) await foundry.applications.api.DialogV2.prompt({window:{title:"Update Summary"},content:`<div>${list("Class levels",summary?.levels)}${list(`Added (${summary?.added?.length||0})`,summary?.added)}${list("Quantities changed",summary?.qty)}${list("Still on the sheet but no longer in the export (left as they are)",summary?.notInExport)}${list("Needs attention",followUp)}${!summary?.levels?.length&&!summary?.added?.length&&!summary?.qty?.length?"<p>Nothing new was found in this export.</p>":""}${backup?`<p class="muted">A backup copy was saved as <b>${esc(backup.name)}</b>. Delete it once you are happy with the update.</p>`:""}</div>`,ok:{label:"Done"}});
+      else if(followUp.length) await foundry.applications.api.DialogV2.prompt({window:{title:"Import Review"},content:`<div><p>The actor was created. These items still need attention on the sheet:</p><ul>${followUp.map(w=>`<li>${esc(w)}</li>`).join("")}</ul><p>Everything else chosen in the wizard was applied.</p></div>`,ok:{label:"Done"}});
       this.close();
     }catch(err){
-      console.error(err);
-      if(actor){ try{ await actor.delete(); }catch(_){} }
-      ui.notifications.error(`Import failed, so the partial actor was removed: ${err.message}`);
+      console.error(err); logImportError(updating?"Updating a character":"Creating a character",err);
+      if(updating) ui.notifications.error(`The update stopped partway: ${err.message}.${backup?` The backup copy "${backup.name}" has the character as it was.`:""} Use Copy diagnostics on the first screen to report it.`,{permanent:true});
+      else { if(actor){ try{ await actor.delete(); }catch(_){} } ui.notifications.error(`Import failed, so the partial actor was removed: ${err.message}. Use Copy diagnostics on the first screen to report it.`); }
     }finally{ this.creating=false; this.setBusy(""); if(button&&this.rendered) button.disabled=false; }
   }
 }
@@ -1482,14 +2053,22 @@ async function openImporter(){
   if(game.system.id!=="dnd5e") return ui.notifications.error("D&D Friends Character Importer requires the dnd5e system.");
   if(!canImport()) return ui.notifications.warn("You need permission to create actors to use the importer.");
   const app=new ImportWizard(); await app.render({force:true});
-  app.setBusy("Indexing compendiums and world items…"); try{ await resolver.load(true); } finally { app.setBusy(""); } await app.render();
+  // Index in the background while the user picks a file; the file handler waits for the same load.
+  if(!resolver.loaded){ app.setBusy("Indexing compendiums and world items…"); const msg="Indexing compendiums and world items…"; resolver.load().catch(e=>console.error(e)).finally(()=>{ if(app.busy===msg&&!app.data){ app.setBusy(""); if(app.rendered) app.render(); } }); }
 }
 
 Hooks.once("init",()=>{
   game.settings.registerMenu(MODULE_ID,"importer",{name:"Open D&D Friends Character Importer",label:"Open Importer",hint:"Import a Discord character bot export into a 2024 D&D 5e actor.",icon:"fas fa-file-import",type:ImportWizard,restricted:true});
+  game.settings.register(MODULE_ID,"itemMatches",{scope:"world",config:false,type:Object,default:{}});
+  game.settings.registerMenu(MODULE_ID,"itemMemoryMenu",{name:"Remembered item matches",label:"Manage",hint:"Item matches people picked by hand. They are reused automatically for every later import.",icon:"fas fa-link",type:ItemMemoryApp,restricted:true});
+  game.settings.register(MODULE_ID,"pyodideUrl",{name:"Python runtime URL (Roll20 export)",hint:"Where Export to Roll20 downloads the Python runtime (Pyodide 0.27.7) from. Leave as is unless your server cannot reach jsDelivr.",scope:"world",config:true,type:String,default:PYODIDE_DEFAULT});
   game.settings.register(MODULE_ID,"remoteUa",{name:"Load Unearthed Arcana feats from GitHub",hint:"When Plutonium's prerelease cache is incomplete, fetch 2024–2026 Unearthed Arcana feat data from TheGiddyLimit/unearthed-arcana on GitHub. Off by default; requires internet access.",scope:"world",config:true,type:Boolean,default:false});
 });
-Hooks.once("ready",()=>{ const mod=game.modules.get(MODULE_ID); if(mod) mod.api={openImporter,parseBotExport,plutoniumBridge,diagnostics:async()=>{ if(!resolver.loaded) await resolver.load(); const api=game.modules.get("plutonium")?.api||{};return {plutonium:{active:plutoniumBridge.detect(),version:plutoniumBridge.version,apiKeys:Object.keys(api),importerKeys:Object.keys(api.importer||{})},resolverEntries:resolver.entries.length,rawPlutoniumFeats:plutoniumBridge.rawFeats.length,remoteUa:plutoniumBridge.remoteUa,plutoniumSources:resolver.plutoniumSources(),rawFeatSources:plutoniumBridge.rawFeatSources(),enabledPlutoniumSources:[...(resolver.enabledPlutoniumSources||[])],originChoicePreview:resolver.entries.filter(e=>resolver.allowed(e)).filter(isOriginStyleChoice).map(e=>({name:e.name,subtype:e.featSubtype,page:e.plutonium?.page||"",source:e.plutonium?.source||e.source?.book||"",uuid:e.uuid})).slice(0,100)};}}; });
+Hooks.once("ready",()=>{
+  try{ game.socket?.on(SOCKET,msg=>{ if(msg?.type==="itemMatches") itemMemory.merge(msg.rec).catch(e=>console.warn(e)); }); }catch(e){ console.warn(`${MODULE_ID} | socket unavailable`,e); }
+  itemMemory.collectFromUsers().catch(e=>console.warn(`${MODULE_ID} | could not collect item matches`,e));
+});
+Hooks.once("ready",()=>{ const mod=game.modules.get(MODULE_ID); if(mod) mod.api={openImporter,parseBotExport,plutoniumBridge,copyDiagnostics,diagnosticsReport,openRoll20Export,itemMemory,openItemMemory:()=>new ItemMemoryApp().render({force:true}),diagnostics:async()=>{ if(!resolver.loaded) await resolver.load(); const api=game.modules.get("plutonium")?.api||{};return {plutonium:{active:plutoniumBridge.detect(),version:plutoniumBridge.version,apiKeys:Object.keys(api),importerKeys:Object.keys(api.importer||{})},resolverEntries:resolver.entries.length,rawPlutoniumFeats:plutoniumBridge.rawFeats.length,remoteUa:plutoniumBridge.remoteUa,plutoniumSources:resolver.plutoniumSources(),rawFeatSources:plutoniumBridge.rawFeatSources(),rawItems:plutoniumBridge.rawItems.length,rawItemLoader:plutoniumBridge.itemLoadInfo||"none",plutoniumItemConverter:plutoniumBridge.itemConverters().length>0,enabledPlutoniumSources:[...(resolver.enabledPlutoniumSources||[])],originChoicePreview:resolver.entries.filter(e=>resolver.allowed(e)).filter(isOriginStyleChoice).map(e=>({name:e.name,subtype:e.featSubtype,page:e.plutonium?.page||"",source:e.plutonium?.source||e.source?.book||"",uuid:e.uuid})).slice(0,100)};}}; });
 Hooks.on("renderActorDirectory",(app,html)=>{
   if(!canImport()) return;
   const root=html instanceof HTMLElement?html:html?.[0]; if(!root||root.querySelector(".cbi-open"))return;
@@ -1497,4 +2076,18 @@ Hooks.on("renderActorDirectory",(app,html)=>{
   const b=document.createElement("button");b.type="button";b.className="cbi-open";b.innerHTML='<i class="fas fa-file-import"></i> D&amp;D Friends Import';b.addEventListener("click",openImporter);host.appendChild(b);
 });
 
-export { openImporter, parseBotExport, ImportWizard };
+// Export to Roll20: a button in the character sheet header and an entry in the Actors sidebar's right-click menu.
+function roll20HeaderControl(app,controls){
+  const actor=app.document||app.actor; if(!actor||actor.type!=="character"||controls.some?.(c=>c.action==="cbiRoll20")) return;
+  controls.push({action:"cbiRoll20",icon:"fa-solid fa-dice-d20",label:"Export to Roll20",ownership:"OWNER",onClick:()=>openRoll20Export(actor)});
+}
+Hooks.on("getHeaderControlsActorSheetV2",roll20HeaderControl);
+Hooks.on("getActorContextOptions",(app,options)=>{
+  const idOf=li=>{ const el=li?.dataset?li:li?.[0]; return el?.dataset?.entryId||el?.dataset?.documentId||el?.closest?.("[data-entry-id]")?.dataset?.entryId; };
+  const actorOf=li=>game.actors?.get(idOf(li));
+  options.push({name:"Export to Roll20",label:"Export to Roll20",icon:'<i class="fa-solid fa-dice-d20"></i>',
+    condition:li=>{ const a=actorOf(li); return !!a&&a.type==="character"&&a.isOwner; }, visible:li=>{ const a=actorOf(li); return !!a&&a.type==="character"&&a.isOwner; },
+    callback:li=>openRoll20Export(actorOf(li)), onClick:(event,li)=>openRoll20Export(actorOf(li||event?.currentTarget))});
+});
+
+export { openImporter, parseBotExport, ImportWizard, openRoll20Export, copyDiagnostics };
