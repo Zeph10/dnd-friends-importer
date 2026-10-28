@@ -1,4 +1,4 @@
-# D&D Friends Character Importer v0.19.10
+# D&D Friends Character Importer v0.20.0
 
 ## Install
 
@@ -11,6 +11,14 @@ https://github.com/Zeph10/dnd-friends-importer/releases/latest/download/module.j
 Requires Foundry VTT 14 and the dnd5e system 5.x.
 
 Foundry VTT 14 / dnd5e 5.x character importer for the Discord character-bot export format.
+
+## Using it
+
+- **Import a character:** Actors sidebar → **D&D Friends Import** → choose the bot's export file. The overview lists only what needs a decision; **Create character** works straight from there.
+- **Level up / re-import:** import the new export the same way. If you already imported that character, the overview picks it under **Import as → Update <name>** and fills in every choice from last time, so usually only the new level's choices are left. New levels, features, feats, spells and items are added; ability scores, gold and item quantities are updated; nothing on the sheet is removed. **Keep a backup copy first** (on by default) saves a copy before changing anything.
+- **Item matches are remembered:** when anyone picks an item match by hand, every later import in the world uses it automatically. GMs can review or forget them under **Configure Settings → D&D Friends Character Importer → Remembered item matches**.
+- **Something went wrong?** Click **Copy diagnostics** on the first screen and paste the text into Discord or a GitHub issue.
+- **Export to Roll20:** in a character sheet's header menu, or by right-clicking the character in the Actors sidebar. It runs the same converter as the website and downloads the Roll20 JSON. The first export in a session downloads the Python runtime (about 10 MB) from jsDelivr.
 
 ## v0.19.9
 
@@ -194,3 +202,70 @@ Workflow
 - Magic item names are trimmed ("Byeshk Greatsword ").
 - An export with an empty Class section is rejected with a clear message.
 - module.json now has `url`, `manifest` and `download` links to github.com/Zeph10/dnd-friends-importer, so Foundry can install and update the module from GitHub.
+
+## v0.19.11
+- Fixes "Psion — found in DDB Subclasses, but stored as Item / class". A real class kept in a compendium named "Subclasses" (such as a UA Psion imported with DDB Importer) is now matched as a class. The rule that treats class-type entries in "Subclasses" packs as subclasses now only applies when the entry has no HitPoints advancement, which every real class has. If a class still is not found, matching falls back to an exact name match on anything stored as a class.
+- Estimated HP uses the matched class's own hit die. Psion is also listed as d6 for when no class document is found (Malazos: 72 instead of 83).
+
+## v0.19.12
+Magic items and gear
+- Equipment matching now includes 2014-era items (Xanathar's, Eberron, 2014 DMG, and DDB Importer compendiums marked 2014). The 2024-only filter still applies to classes, subclasses, species, feats and spells. When both a 2024 and a 2014 version exist, the 2024 version wins. 2014 matches show "(2014 · source)" in the item dropdown.
+- Items that Plutonium/5etools knows about but nobody has imported into Foundry yet appear as "create from 5etools (SRC)" options and are created on import. Generic variants such as Byeshk Weapon resolve to the specific item (Byeshk Greatsword).
+  - If Plutonium exposes its item converter, the item is created with Plutonium's full data (activities, effects).
+  - Otherwise the importer builds a native dnd5e item from the 5etools data: weapon damage, versatile damage, range, properties, mastery and an attack; armor AC, strength and stealth; potion/scroll/wand consumables; rarity, attunement, weight and price; description text. Its other mechanics stay as text, and the final review lists it as "Created from 5etools text, check its mechanics".
+- Differently named items no longer collapse onto one match. Potion of Superior Healing and Potion of Greater Healing now become their own items instead of both matching Potion of Healing.
+- Placeholders keep the export's rarity and attunement. Magic-item placeholders are created as equipment so they can be attuned.
+- Armor, shields and weapons matched from 2014 or 5etools sources also start equipped.
+- Diagnostics (`game.modules.get("dnd-friends-character-importer").api.diagnostics()`) report how many 5etools items were loaded, which loader worked, and whether Plutonium's item converter is available.
+
+## v0.19.13
+Faster loading
+- Compendiums are read through their indexes (a few fields per entry) instead of loading every document, in parallel, and only once per session. Indexing starts as soon as the importer opens, so it is usually finished by the time you pick a file. Loading a second character reuses the same index.
+- A **Refresh content** link on the Upload step re-reads compendiums after you import new content with Plutonium or DDB Importer.
+- Packs hidden from players are skipped when a player runs the importer.
+
+Quick import
+- After you choose a file, an overview lists only what needs you:
+  - **Must choose** (blocks Create): the 2 free skills (pickable right in the overview), an unmatched Origin feat, unfinished class/species/feat choices, duplicate or invalid Expertise picks.
+  - **Worth a look**: unmatched species/class/subclass, items that will be placeholders or matched with low confidence, casters with no spells chosen, spells over the limit, feats that will be placeholders.
+  - **Matched automatically**: everything else, collapsed.
+- Each row links to the step that fixes it, and every later step has an **Overview** button to come back.
+- **Create character** works straight from the overview. Equipment matches, equipped state and traits are filled in automatically, exactly as if you had clicked through each step. **Review step by step** still opens the full wizard.
+- The file box shrinks after a file is loaded.
+
+Players
+- Players who import their own character now own the actor. Before, the importer's explicit ownership replaced Foundry's default and left the player unable to edit or add items to the actor they had just created.
+- The Owner picker is only shown to GMs.
+
+Fixes
+- Items created through Plutonium's converter now get their equipped and attuned state set even when the converter leaves those fields out.
+
+## v0.20.0
+Update existing characters (level-ups and re-imports)
+- The overview has **Import as**: New character, or Update one of your characters. A character imported before with the same name is picked automatically.
+- Update mode adds what is new and keeps everything else:
+  - Class levels go up in place. HP already chosen or rolled for earlier levels is kept; new levels use the average (or the fixed HP you enter).
+  - New classes (multiclassing), subclasses, features, feats, spells and items are added. Anything already on the sheet with the same name is left exactly as it is.
+  - Ability scores, gold and item quantities follow the export. Proficiencies, languages, resistances and senses are only ever added, never removed.
+  - Current HP goes up by the increase in maximum HP. Spell slots are left alone.
+  - Items imported earlier that are no longer in the export stay on the sheet and are listed in the summary.
+- **Keep a backup copy first** (on by default) saves "Name (backup date)" before the update. If an update fails partway, the error names the backup.
+- An **Update Summary** lists level changes, what was added, changed quantities and anything that needs attention.
+
+Saved choices
+- Every choice made in the wizard is saved on the actor (free skills, feat and species choices, class order, spells, item matches and equipped state, spellcasting settings, feature placement). Re-importing the character fills them all in again.
+- The actor also keeps a short import history (date, file, level, who imported it).
+
+Remembered item matches
+- Item matches picked by hand are remembered for the whole world and used automatically for every later import, for every player. The overview counts them as "from remembered picks".
+- Players' picks are saved on their own user right away and passed to the GM's client (module socket), which adds them to the world list. Picks made while no GM is online are collected the next time a GM logs in.
+- GMs can review and forget remembered matches under **Configure Settings → D&D Friends Character Importer → Remembered item matches**.
+
+Copy diagnostics
+- **Copy diagnostics** on the first screen copies a plain-text report: module, Foundry, dnd5e, Plutonium and DDB Importer versions, how much content was indexed, the current character's matches and open questions, and the last errors. Failure messages now point to it.
+
+Export to Roll20 from Foundry
+- **Export to Roll20** in the character sheet header and in the Actors sidebar's right-click menu.
+- It runs the Foundry → Roll20 Converter's own Python code (converter 1.4.0, bundled as `scripts/roll20-converter.js`) in the browser with Pyodide, so the output is identical to the website's. You can pick the spellcasting ability and which temporary effects to bake in, see the converter's warnings, and download the JSON and the conversion report.
+- The Python runtime (Pyodide 0.27.7, about 10 MB) downloads from jsDelivr the first time in a session. A world setting, **Python runtime URL**, can point it elsewhere.
+- To ship a newer converter, run `python3 tools/build_converter_js.py path/to/converter.py scripts/roll20-converter.js`.
