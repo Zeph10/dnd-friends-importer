@@ -10,6 +10,8 @@ const HIT_DIE = {barbarian:12, fighter:10, paladin:10, ranger:10, artificer:8, b
 const DAMAGE_TYPES=["acid","bludgeoning","cold","fire","force","lightning","necrotic","piercing","poison","psychic","radiant","slashing","thunder"];
 const CONDITION_TYPES=["blinded","charmed","deafened","frightened","grappled","incapacitated","invisible","paralyzed","petrified","poisoned","prone","restrained","stunned","unconscious"];
 const SENSE_TYPES=["darkvision","blindsight","tremorsense","truesight"];
+const TRAIT_SETS=["dr","di","dv","ci","languages","tools"];
+const STEP_NAMES=["Upload","Character","Choices","Spells","Equipment","Traits","Review"];
 const PHYSICAL_TYPES=new Set(["weapon","equipment","consumable","tool","loot","container","backpack"]);
 const SIZE_KEYS={tiny:"tiny",small:"sm",medium:"med",large:"lg",huge:"huge",gargantuan:"grg"};
 function traitKey(v=""){ return String(v??"").trim().toLowerCase(); }
@@ -25,16 +27,34 @@ class PythonLiteralParser {
   parse() { this.ws(); const v=this.value(); this.ws(); if(this.i!==this.t.length) throw new Error(`Unexpected text at ${this.i}`); return v; }
   ws(){ while(/\s/.test(this.t[this.i]||"")) this.i++; }
   value(){ this.ws(); const c=this.t[this.i]; if(c==="{") return this.dict(); if(c==="[") return this.list(); if(c==="(" ) return this.tuple(); if(c==="'"||c==='"') return this.str(); const rest=this.t.slice(this.i); for(const [k,v] of [["None",null],["True",true],["False",false]]) if(rest.startsWith(k)){this.i+=k.length;return v;} const m=rest.match(/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?/); if(m){this.i+=m[0].length;return Number(m[0]);} throw new Error(`Unexpected token at ${this.i}`); }
-  str(){ const q=this.t[this.i++]; let out=""; while(this.i<this.t.length){ let c=this.t[this.i++]; if(c===q) return out; if(c==="\\"){ const n=this.t[this.i++]; out += ({n:"\n",r:"\r",t:"\t",b:"\b",f:"\f",v:"\v",a:"\x07"}[n] ?? n); } else out+=c; } throw new Error("Unterminated string"); }
+  str(){
+    const q=this.t[this.i++]; let out="";
+    // Python's repr() writes non-printable characters as \xHH, \uHHHH or \UHHHHHHHH (a non-breaking space is "\xa0").
+    const hex=n=>{ const h=this.t.slice(this.i,this.i+n); if(h.length!==n||!/^[0-9a-fA-F]+$/.test(h)) throw new Error(`Bad escape at ${this.i}`); this.i+=n; return String.fromCodePoint(parseInt(h,16)); };
+    while(this.i<this.t.length){
+      const c=this.t[this.i++]; if(c===q) return out; if(c!=="\\"){ out+=c; continue; }
+      const n=this.t[this.i++];
+      if(n==="x") out+=hex(2); else if(n==="u") out+=hex(4); else if(n==="U") out+=hex(8);
+      else if(n==="\n") continue;
+      else if(/[0-7]/.test(n||"")){ let o=n; while(o.length<3&&/[0-7]/.test(this.t[this.i]||"")) o+=this.t[this.i++]; out+=String.fromCharCode(parseInt(o,8)); }
+      else out += ({n:"\n",r:"\r",t:"\t",b:"\b",f:"\f",v:"\v",a:"\x07"}[n] ?? n);
+    }
+    throw new Error("Unterminated string");
+  }
   dict(){ const o={}; this.i++; this.ws(); if(this.t[this.i]==="}"){this.i++;return o;} while(true){ const k=this.value(); this.ws(); if(this.t[this.i++]!==":") throw new Error("Expected :"); o[String(k)]=this.value(); this.ws(); if(this.t[this.i]===","){this.i++;this.ws(); if(this.t[this.i]==="}"){this.i++;return o;} continue;} if(this.t[this.i]!=="}") throw new Error("Expected }"); this.i++; return o; } }
   list(){ return this.seq("[","]"); }
   tuple(){ return this.seq("(",")"); }
   seq(open,close){ const a=[]; this.i++; this.ws(); if(this.t[this.i]===close){this.i++;return a;} while(true){a.push(this.value());this.ws();if(this.t[this.i]===","){this.i++;this.ws();if(this.t[this.i]===close){this.i++;return a;}continue;}if(this.t[this.i]!==close) throw new Error(`Expected ${close}`);this.i++;return a;} }
 }
 
+const NOT_AN_EXPORT="This is not a D&D Friends bot export. The file is neither JSON nor the bot's Python-style text.";
 function parseBotExport(text){
+  const src=String(text??"").replace(/^\uFEFF/,"");
+  if(!src.trim()) throw new Error("The file is empty.");
   let data;
-  try { data=JSON.parse(text); } catch (_) { data=new PythonLiteralParser(text.replace(/^\uFEFF/,"")).parse(); }
+  try { data=JSON.parse(src); }
+  catch (_) { try { data=new PythonLiteralParser(src).parse(); } catch (__) { throw new Error(NOT_AN_EXPORT); } }
+  if(!data||typeof data!=="object"||Array.isArray(data)) throw new Error(NOT_AN_EXPORT);
   return normalizeBotExport(data);
 }
 /**
@@ -54,6 +74,13 @@ function normalizeBotExport(data){
   else data.Feats=typeof feats==="string"&&feats.trim()?[feats.trim()]:[];
   for(const k of ["Class","Magic Items","Consumables","Inventory","Stats"]) if(!data[k]||typeof data[k]!=="object") data[k]={};
   for(const v of Object.values(data["Magic Items"])) if(v&&typeof v.Name==="string") v.Name=v.Name.trim();
+  // Class levels must be whole numbers: they size arrays and are shown in the wizard.
+  for(const [cn,c] of Object.entries(data.Class)){
+    const cls=(c&&typeof c==="object")?c:{Level:c}; const lvl=Number(cls.Level);
+    if(!Number.isInteger(lvl)||lvl<1||lvl>30) throw new Error(`The export lists ${cn} at level "${cls.Level}", which is not a whole number from 1 to 30.`);
+    cls.Level=lvl; data.Class[cn]=cls;
+  }
+  if(data.Level!==undefined&&data.Level!==null){ const l=Number(data.Level); data.Level=Number.isFinite(l)?Math.max(0,Math.floor(l)):0; }
   Object.defineProperty(data,"__featStatBonuses",{value:featBonuses,enumerable:false,writable:true});
   return data;
 }
@@ -74,7 +101,9 @@ function placementLabel(k){ return ({background:"Background",species:"Species",c
 function featurePlacementKey(prefix,name){ return `${prefix}:${norm(name)}`; }
 function spellScrollInnerName(name="") { const m=/^Spell\s+Scroll\s*\((.+)\)\s*$/i.exec(String(name).trim()); return m?.[1]?.trim()||""; }
 const QTY_GAIN=["BUY","CREATE","REWARD","FOUND","GAIN","LOOT"], QTY_LOSS=["USED","USE","SOLD","SELL","LOST","CONSUMED","SPENT","GIVEN"];
-function acquisitionQty(v={}) { const up=k=>Number(v?.[k])||0; const keys=Object.keys(v||{}).map(k=>k.toUpperCase()); const gain=QTY_GAIN.reduce((n,k)=>n+up(k),0); if(!gain) return 1; const loss=QTY_LOSS.reduce((n,k)=>n+up(k),0); return keys.some(k=>QTY_LOSS.includes(k))?Math.max(0,gain-loss):gain; }
+/** Numeric values of an item record with upper-cased keys, so "Buy", "buy" and "BUY" all count. */
+function upperKeyed(v){ const o={}; for(const [k,x] of Object.entries(v||{})){ const n=typeof x==="number"?x:(typeof x==="string"&&x.trim()!=="")?Number(x):NaN; if(Number.isFinite(n)){ const K=k.toUpperCase(); o[K]=(o[K]||0)+n; } } return o; }
+function acquisitionQty(v={}) { const u=upperKeyed(v); const sum=keys=>keys.reduce((n,k)=>n+(u[k]||0),0); const gain=sum(QTY_GAIN); if(!gain) return 1; return Math.max(0,gain-sum(QTY_LOSS)); }
 function consumableQty(v={}) { const keys=Object.keys(v||{}).map(k=>k.toUpperCase()); if(keys.some(k=>QTY_GAIN.includes(k)||QTY_LOSS.includes(k))) return acquisitionQty(v); return Object.values(v||{}).filter(x=>typeof x==="number").reduce((a,b)=>a+b,0)||1; }
 function uniqueFeatNames(data){
   const out=[]; const seen=new Set();
@@ -95,7 +124,6 @@ function baseStats(data){
   if(!data.__featBonusesInStats) for(const b of (data.__featStatBonuses||[])) applyStatBonus(s,b);
   return s;
 }
-function rawStats(data){ const s={}; for(const a of ABILITIES) s[a]=Number(data.Stats?.[a.toUpperCase()] ?? 10); return s; }
 /** Scores including the bot's magic-item Stat Bonuses. `include(key)` limits which items count (default: all). */
 function effectiveStats(data, include=()=>true){
   const s=baseStats(data);
@@ -121,7 +149,11 @@ function averageHp(data, order=defaultClassOrder(data), overrideCon=null, dice={
 // Fields therefore use exactly the shape dnd5e itself uses: "system.source" whole, "system.type.*" nested.
 const INDEX_FIELDS=["system.advancement","system.source","system.identifier","system.level","system.type.value","system.type.subtype","system.type.baseItem","system.mastery","system.requirements","system.classIdentifier","flags.plutonium.spellClassNames","flags.plutonium.page","flags.plutonium.source","flags.plutonium.hash"];
 class ContentResolver {
-  constructor(){ this.entries=[]; this.excludedEntries=[]; this.packDiscoveries=[]; this.loaded=false; this.enabledPlutoniumSources=null; }
+  constructor(){ this.entries=[]; this.excludedEntries=[]; this.byUuid=new Map(); this.excludedByUuid=new Map(); this.packDiscoveries=[]; this.loaded=false; this.enabledPlutoniumSources=null; }
+  /** A 2024-eligible entry by UUID. */
+  get(uuid){ return this.byUuid.get(uuid)||null; }
+  /** Any indexed entry by UUID, including content the 2024 filter set aside. */
+  getAny(uuid){ return this.byUuid.get(uuid)||this.excludedByUuid.get(uuid)||null; }
   /** One shared load per session; `force` re-reads everything (the "Refresh content" button). */
   async load(force=false){
     if(this.loaded&&!force) return;
@@ -130,11 +162,13 @@ class ContentResolver {
     return this._loading;
   }
   async _load(force=false){
-    if(force){this.entries=[];this.excludedEntries=[];this.packDiscoveries=[];this.loaded=false;}
-    const add=(d,uuid,ctx={})=>{ const e=this.entry(d,uuid,ctx); (this.is2024(d,e)?this.entries:this.excludedEntries).push(e); return e; };
-    for(const item of game.items) add(item,item.uuid,{location:"World Items"});
-    // Re-use high-quality documents already embedded on actors as templates.
-    for(const actor of game.actors) for(const item of actor.items) add(item,item.uuid,{location:`Actor: ${actor.name}`});
+    if(force){this.entries=[];this.excludedEntries=[];this.byUuid=new Map();this.excludedByUuid=new Map();this.packDiscoveries=[];this.loaded=false;}
+    const add=(d,uuid,ctx={})=>{ const e=this.entry(d,uuid,ctx); const ok=this.is2024(d,e); (ok?this.entries:this.excludedEntries).push(e); const map=ok?this.byUuid:this.excludedByUuid; if(!map.has(uuid)) map.set(uuid,e); return e; };
+    // A placeholder from an earlier import is not real content: matching it would hide the "will be a placeholder" warning.
+    const isPlaceholder=item=>!!item.flags?.[MODULE_ID]?.placeholder||item.system?.source?.custom===PLACEHOLDER_SOURCE;
+    for(const item of game.items) if(!isPlaceholder(item)) add(item,item.uuid,{location:"World Items"});
+    // Re-use high-quality documents already embedded on actors as templates. Backup copies are skipped.
+    for(const actor of game.actors){ if(actor.flags?.[MODULE_ID]?.backupOf) continue; for(const item of actor.items) if(!isPlaceholder(item)) add(item,item.uuid,{location:`Actor: ${actor.name}`}); }
 
     // Scan every compendium, not just packs whose metadata advertises documentName === "Item".
     // DDB Importer and some other modules can organize imported subclasses in packs/folders whose
@@ -198,7 +232,7 @@ class ContentResolver {
     return raw;
   }
   entry(d,uuid,ctx={}){
-    return {name:d.name,type:this.inferType(d,ctx),rawType:String(d.type||""),uuid,source:d.system?.source||{},identifier:d.system?.identifier||"",requirements:d.system?.requirements||"",level:d.system?.level,featType:d.system?.type?.value||"",featSubtype:d.system?.type?.subtype||"",itemTypeValue:d.system?.type?.value||"",itemBaseItem:d.system?.type?.baseItem||"",mastery:d.system?.mastery||"",classIdentifier:d.system?.classIdentifier||"",spellClasses:d.flags?.plutonium?.spellClassNames||[],plutonium:d.flags?.plutonium||{},packCollection:ctx.packCollection||"",packTitle:ctx.packTitle||"",packFolder:ctx.packFolder||"",packDocumentName:ctx.packDocumentName||"",location:ctx.location||""};
+    return {name:d.name,n:norm(d.name),type:this.inferType(d,ctx),rawType:String(d.type||""),uuid,source:d.system?.source||{},identifier:d.system?.identifier||"",requirements:d.system?.requirements||"",level:d.system?.level,featType:d.system?.type?.value||"",featSubtype:d.system?.type?.subtype||"",itemTypeValue:d.system?.type?.value||"",itemBaseItem:d.system?.type?.baseItem||"",mastery:d.system?.mastery||"",classIdentifier:d.system?.classIdentifier||"",spellClasses:d.flags?.plutonium?.spellClassNames||[],plutonium:d.flags?.plutonium||{},packCollection:ctx.packCollection||"",packTitle:ctx.packTitle||"",packFolder:ctx.packFolder||"",packDocumentName:ctx.packDocumentName||"",location:ctx.location||""};
   }
   is2024(d,e=null){
     const rules=String(d.system?.source?.rules||"").trim(); const book=String(d.system?.source?.book||"").trim(); const ps=String(d.flags?.plutonium?.source||"").trim();
@@ -217,7 +251,7 @@ class ContentResolver {
   }
   diagnostic(name,types=[]){
     const n=norm(name);
-    const scoreRows=rows=>rows.filter(e=>!types.length||types.includes(e.type)).map(e=>({...e,score:this.score(n,norm(e.name),e.type)})).filter(e=>e.score>=0.52).sort((a,b)=>b.score-a.score);
+    const scoreRows=rows=>this.scored(rows,n,types).sort((a,b)=>b.score-a.score);
     const eligible=scoreRows(this.entries);
     const disabled=eligible.filter(e=>!this.allowed(e));
     if(disabled.length){const src=[...new Set(disabled.map(e=>plutoniumSourceKey(e)).filter(Boolean))];return `found, but disabled source${src.length===1?'':'s'}: ${src.join(', ')}`;}
@@ -233,9 +267,14 @@ class ContentResolver {
   allowed(e){ const ps=plutoniumSourceKey(e); return !ps || this.enabledPlutoniumSources===null || this.enabledPlutoniumSources.has(ps); }
   plutoniumSources(){ const counts=new Map(); for(const e of this.entries){ const ps=plutoniumSourceKey(e); if(ps)counts.set(ps,(counts.get(ps)||0)+1); } return [...counts.entries()].map(([code,count])=>({code,count})).sort((a,b)=>a.code.localeCompare(b.code)); }
   priority(e){ if(String(e.uuid).startsWith("Compendium.dnd5e."))return 30; if(String(e.uuid).startsWith("Compendium."))return 20; if(String(e.uuid).startsWith("Actor."))return 15; return 10; }
+  /** Copies of the rows of the wanted types that score at least 0.52 against a normalised name, each with its score. */
+  scored(rows,n,types=[],extra=null){
+    const out=[];
+    for(const e of rows){ if(types.length&&!types.includes(e.type)) continue; const score=this.score(n,e.n??norm(e.name),e.type); if(score>=0.52) out.push({...e,...extra,score}); }
+    return out;
+  }
   candidates(name, types=[]){
-    const n=norm(name); const pool=this.entries.filter(e=>this.allowed(e)).filter(e=>!types.length||types.includes(e.type));
-    const scored=pool.map(e=>({...e,score:this.score(n,norm(e.name),e.type)})).filter(e=>e.score>=0.52)
+    const scored=this.scored(this.entries.filter(e=>this.allowed(e)),norm(name),types)
       .sort((a,b)=>(b.score-a.score)||(this.priority(b)-this.priority(a)));
     const out=[], seen=new Set();
     for(const e of scored){ const k=`${e.type}:${norm(e.name)}`; if(seen.has(k))continue; seen.add(k); out.push(e); if(out.length>=8)break; }
@@ -255,8 +294,7 @@ class ContentResolver {
    */
   itemCandidates(name,types=[]){
     const n=norm(name);
-    const rows=[...this.entries.filter(e=>this.allowed(e)).map(e=>({...e,legacy:false})),...this.excludedEntries.map(e=>({...e,legacy:true}))]
-      .filter(e=>!types.length||types.includes(e.type)).map(e=>({...e,score:this.score(n,norm(e.name),e.type)})).filter(e=>e.score>=0.52)
+    const rows=[...this.scored(this.entries.filter(e=>this.allowed(e)),n,types,{legacy:false}),...this.scored(this.excludedEntries,n,types,{legacy:true})]
       .sort((a,b)=>(b.score-a.score)||((a.legacy?1:0)-(b.legacy?1:0))||(this.priority(b)-this.priority(a)));
     const out=[],seen=new Set(); for(const e of rows){ const k=`${e.type}:${norm(e.name)}`; if(seen.has(k)) continue; seen.add(k); out.push(e); if(out.length>=8) break; }
     return out;
@@ -264,7 +302,7 @@ class ContentResolver {
   /** Class match; if none, an exact-name document whose raw type is "class" (e.g. re-labelled by pack heuristics). */
   bestClass(name){
     const hit=this.best(name,["class"]); if(hit) return hit;
-    const n=norm(name); const rows=this.entries.filter(e=>this.allowed(e)&&String(e.rawType||"").toLowerCase()==="class"&&norm(e.name)===n).sort((a,b)=>this.priority(b)-this.priority(a));
+    const n=norm(name); const rows=this.entries.filter(e=>this.allowed(e)&&String(e.rawType||"").toLowerCase()==="class"&&e.n===n).sort((a,b)=>this.priority(b)-this.priority(a));
     return rows[0]?{...rows[0],type:"class",score:1}:null;
   }
   bestSubclass(name,classIdentifier=""){
@@ -274,18 +312,22 @@ class ContentResolver {
 }
 
 async function getDoc(uuid){ if(!uuid) return null; try{return await fromUuid(uuid);}catch(_){return null;} }
+/**
+ * Advancements of a document or of plain item data, whatever holds them: an array, an object keyed by id, or the
+ * Map-based collection dnd5e puts on live documents (Object.values() of that collection is empty).
+ */
+function advancementList(doc){
+  const raw=doc?.system?.advancement; if(!raw||typeof raw==="string") return [];
+  if(Array.isArray(raw)) return raw;
+  try{ if(typeof raw.values==="function") return [...raw.values()]; }catch(_){}
+  return Object.values(raw);
+}
+/** The same advancements as plain data. */
+function advancementData(doc){ return advancementList(doc).map(a=>a?.toObject?.()||a).filter(Boolean); }
+/** dnd5e 6.0 renamed an advancement's `title` to `name`; read whichever the data has. */
+function advTitle(a){ return String(a?.title||a?.name||""); }
 function advancementEntries(doc, level=99, isPrimary=true){
-  const raw=doc?.system?.advancement;
-  if(!raw) return [];
-  let adv=[];
-  try {
-    if(Array.isArray(raw)) adv=raw;
-    else if(typeof raw.values==="function") adv=[...raw.values()];
-    else if(typeof raw[Symbol.iterator]==="function" && typeof raw!=="string") adv=[...raw].map(x=>Array.isArray(x)&&x.length===2?x[1]:x);
-    else adv=Object.values(raw);
-  } catch(_) { adv=Object.values(raw||{}); }
-  adv=adv.map(a=>a?.toObject?.()||a).filter(Boolean);
-  return adv.filter(a=>{
+  return advancementData(doc).filter(a=>{
     if(Number(a.level||0)>level) return false;
     const r=norm(a.classRestriction||"");
     if(!r) return true;
@@ -357,15 +399,9 @@ function preferredOriginChoice(a,b){
   };
   return rank(b)-rank(a);
 }
-function docAdvancements(doc){
-  const raw=doc?.system?.advancement;if(!raw)return[];try{if(Array.isArray(raw))return raw.map(x=>x?.toObject?.()||x);if(typeof raw.values==="function")return [...raw.values()].map(x=>x?.toObject?.()||x);return Object.values(raw).map(x=>x?.toObject?.()||x);}catch(_){return[];}
-}
-function featHasAbilityIncrease(doc){return docAdvancements(doc).some(a=>a?.type==="AbilityScoreImprovement"&&Number(a?.configuration?.points||0)>0);}
-function isStandaloneFeatEntry(e){if(e?.type!=="feat")return false;const page=norm(e.plutonium?.page||""),type=norm(e.featType||"");if(/classfeature|subclassfeature|optionalfeature|racefeature|backgroundfeature/.test(page))return false;if(["class","race","background"].includes(type))return false;if(/^lessons of the first ones\s*:/i.test(String(e.name||"")))return false;return true;}
 function spellRefsFromHtml(html="",level=99){const out=[];try{const box=document.createElement("div");box.innerHTML=String(html||"");const rows=[...box.querySelectorAll("tr")];for(const row of rows){const cells=[...row.querySelectorAll("td,th")];if(cells.length<2)continue;const req=Number(String(cells[0].textContent||"").match(/\d+/)?.[0]);if(Number.isFinite(req)&&req>level)continue;const src=cells.slice(1).map(c=>c.innerHTML).join(" ");for(const m of src.matchAll(/@spell\[([^\]|]+)(?:\|([^\]]+))?\]/gi))out.push({name:m[1].trim(),source:(m[2]||"").trim(),level:req||0});}if(out.length)return out;if(/always\s+(?:have|prepared)|spells?\s+table/i.test(box.textContent||""))for(const m of String(html).matchAll(/@spell\[([^\]|]+)(?:\|([^\]]+))?\]/gi))out.push({name:m[1].trim(),source:(m[2]||"").trim(),level:0});}catch(_){}return out;}
 function effectObjects(doc){const raw=doc?.effects||[];try{return Array.isArray(raw)?raw.map(x=>x?.toObject?.()||x):[...raw].map(x=>x?.toObject?.()||x);}catch(_){return[];}}
 function splitTraitValues(v){if(Array.isArray(v))return v.map(String);const s=String(v??"").trim();if(!s)return[];try{const j=JSON.parse(s);if(Array.isArray(j))return j.map(String);}catch(_){}return s.split(/[;,|]/).map(x=>x.trim()).filter(Boolean);}
-function configOptions(obj,fallback=[]){try{return Object.entries(obj||{}).map(([value,v])=>({value,label:game.i18n.localize(v?.label||v)||value})).sort((a,b)=>a.label.localeCompare(b.label));}catch(_){return fallback;}}
 async function resolveChoicePool(adv){
   const cfg=adv?.configuration||{};
   const restriction=cfg.restriction||{};
@@ -387,7 +423,7 @@ async function resolveChoicePool(adv){
   const pool=cfg.pool||[]; const out=[];
   for(const raw of pool){
     const uuid=typeof raw==="string"?raw:raw?.uuid; if(!uuid) continue;
-    const d=await getDoc(uuid); const idx=resolver.entries.find(e=>e.uuid===uuid); out.push({uuid,name:d?.name||idx?.name||uuidLabelFallback(uuid)});
+    const d=await getDoc(uuid); const idx=resolver.get(uuid); out.push({uuid,name:d?.name||idx?.name||uuidLabelFallback(uuid)});
   }
   return out;
 }
@@ -429,7 +465,7 @@ const TOOL_CATEGORIES={
 };
 const TOOL_STANDALONE=["disg","forg","herb","navg","pois","thief"];
 const VEHICLE_LABELS={air:"Airships",land:"Land Vehicles",space:"Spelljammers",water:"Water Vehicles"};
-function toolLabel(id){ const row=TOOL_OPTIONS_2024.find(([,v])=>v===id); if(row) return row[0]; if(VEHICLE_LABELS[id]) return VEHICLE_LABELS[id]; try{ const u=CONFIG?.DND5E?.tools?.[id]?.id; const e=u&&resolver.entries.find(x=>x.uuid===u); if(e) return e.name; }catch(_){} return String(id); }
+function toolLabel(id){ const row=TOOL_OPTIONS_2024.find(([,v])=>v===id); if(row) return row[0]; if(VEHICLE_LABELS[id]) return VEHICLE_LABELS[id]; try{ const u=CONFIG?.DND5E?.tools?.[id]?.id; const e=u&&resolver.get(u); if(e) return e.name; }catch(_){} return String(id); }
 const ARMOR_LABELS={lgt:"Light Armor",med:"Medium Armor",hvy:"Heavy Armor",shl:"Shields"};
 const ABILITY_LABELS={str:"Strength",dex:"Dexterity",con:"Constitution",int:"Intelligence",wis:"Wisdom",cha:"Charisma"};
 /** Expand dnd5e Trait pool keys ("skills:*", "tool:music:*", "languages:standard:*", "weapon:mar:*") into concrete choices. */
@@ -461,7 +497,6 @@ function expandTraitPool(pool=[]){
   }
   return [...out.values()];
 }
-function languagePoolOptions(pool=[]){ return null; } // Superseded by expandTraitPool (kept for API compatibility).
 function maxSpellLevelForProgression(progression="none", level=0){
   const p=norm(progression), l=Math.max(0,Number(level)||0);
   if(!l||p==="none")return 0;
@@ -802,7 +837,8 @@ class PlutoniumBridge {
   }
   rawItemCandidates(name){
     const n=norm(name); if(!n) return [];
-    return this.rawItems.map(it=>({it,score:resolver.score(n,norm(it.name),"")})).filter(x=>x.score>=0.52)
+    const names=(this._rawItemNames??=new WeakMap()); const nameOf=it=>{ let v=names.get(it); if(v===undefined){ v=norm(it.name); names.set(it,v); } return v; };
+    return this.rawItems.map(it=>({it,score:resolver.score(n,nameOf(it),"")})).filter(x=>x.score>=0.52)
       .sort((a,b)=>(b.score-a.score)||((is2024Source(b.it.source)?1:0)-(is2024Source(a.it.source)?1:0)))
       .slice(0,6).map(x=>({...this.rawItemEntry(x.it),score:x.score}));
   }
@@ -854,11 +890,16 @@ class PlutoniumBridge {
       const k=norm(e.name), set=this.spellClassMap.get(k)||new Set(); for(const c of e.spellClasses)set.add(norm(c)); this.spellClassMap.set(k,set);
     }
   }
-  legalSpell(entry,classNames){ const set=this.spellClassMap.get(norm(entry.name)); if(!set?.size)return null; return classNames.some(c=>set.has(norm(c))); }
 }
 const plutoniumBridge=new PlutoniumBridge();
 
 const resolver=new ContentResolver();
+
+/**
+ * Foundry expands dots in object keys when it saves flags ("Compendium.dnd5e.spells24.Item.x" becomes nested objects),
+ * so anything keyed by a UUID or an item name is saved as [key, value] pairs. Older saves used plain objects.
+ */
+function fromPairs(v){ return Array.isArray(v)?v.filter(p=>Array.isArray(p)&&p.length===2):Object.entries(v&&typeof v==="object"?v:{}); }
 
 function flattenOwned(data){
   const out=[];
@@ -869,6 +910,8 @@ function flattenOwned(data){
 }
 
 const MATCH_CONFIDENT=0.85;
+/** `system.source.custom` on every placeholder item; also how placeholders from older versions are recognised. */
+const PLACEHOLDER_SOURCE="D&D Friends Character Importer";
 const EQUIP_TYPES=["equipment","weapon","consumable","loot","tool","container"];
 
 /** Write dnd5e 5.x spell preparation fields, plus the legacy fields for systems that still use them. */
@@ -901,7 +944,6 @@ function applySpellConfig(d,cfg,ownerDoc,stats=null){
   }
   return d;
 }
-function advancementList(doc){ const raw=doc?.system?.advancement; if(!raw) return []; return Array.isArray(raw)?raw:Object.values(raw); }
 
 /**
  * 2024 PHB cantrip and prepared-spell limits by class level (index 0 = level 1).
@@ -926,19 +968,20 @@ function scaleValueAt(adv,level){
 }
 /** Limits from a class/subclass document's own ScaleValue advancements (dnd5e 2024 classes, homebrew classes). */
 function spellLimitsFromDoc(doc,level){
-  const advs=advancementList(doc).filter(a=>a?.type==="ScaleValue"); if(!advs.length) return {};
-  const idOf=a=>String(a.configuration?.identifier||norm(a.title||"").replace(/ /g,"-"));
+  const advs=advancementData(doc).filter(a=>a?.type==="ScaleValue"); if(!advs.length) return {};
+  const idOf=a=>String(a.configuration?.identifier||norm(advTitle(a)||"").replace(/ /g,"-"));
   const prepId=(String(doc?.system?.spellcasting?.preparation?.formula||"").match(/@scale\.[^.\s]+\.([\w-]+)/)||[])[1];
-  const prep=advs.find(a=>prepId&&idOf(a)===prepId)||advs.find(a=>/prepared/i.test(`${idOf(a)} ${a.title||""}`));
-  const cant=advs.find(a=>/cantrip/i.test(`${idOf(a)} ${a.title||""}`));
+  const prep=advs.find(a=>prepId&&idOf(a)===prepId)||advs.find(a=>/prepared/i.test(`${idOf(a)} ${advTitle(a)||""}`));
+  const cant=advs.find(a=>/cantrip/i.test(`${idOf(a)} ${advTitle(a)||""}`));
   return {cantrips:cant?scaleValueAt(cant,level):undefined,prepared:prep?scaleValueAt(prep,level):undefined};
 }
 
 /* ===================================================================================== */
 /* Shared services: recent errors, remembered item matches, diagnostics, Roll20 export   */
 /* ===================================================================================== */
+/** dnd5e 6.1 moved Fighting Style, Weapon Mastery and similar choices from the class onto the granted feature. */
+function featureChoicesMoved(){ try{ return foundry.utils.isNewerVersion(game.system?.version||"0","6.0.999"); }catch(_){ return false; } }
 function moduleVersion(){ return game.modules.get(MODULE_ID)?.version||""; }
-function moduleUrl(path){ const p=`modules/${MODULE_ID}/${path}`; try{ return foundry.utils.getRoute?.(p)??p; }catch(_){ return p; } }
 
 /** The last few errors, so "Copy diagnostics" can include them. */
 const recentErrors=[];
@@ -1004,7 +1047,10 @@ class ItemMemoryApp extends foundry.applications.api.ApplicationV2 {
   _replaceHTML(result,content){
     content.replaceChildren(result);
     content.querySelectorAll("[data-forget]").forEach(b=>b.addEventListener("click",async()=>{ await itemMemory.forget([b.dataset.forget]); this.render(); }));
-    content.querySelector("[data-forget-all]")?.addEventListener("click",async()=>{ await itemMemory.forget(Object.keys(itemMemory.world())); this.render(); });
+    content.querySelector("[data-forget-all]")?.addEventListener("click",async()=>{
+      const keys=Object.keys(itemMemory.world());
+      const ok=await foundry.applications.api.DialogV2.confirm({window:{title:"Forget all remembered matches?"},content:`<p>This forgets all ${keys.length} remembered item matches for everyone in this world. Later imports go back to automatic matching.</p>`});
+      if(!ok) return; await itemMemory.forget(keys); this.render(); });
   }
 }
 
@@ -1126,12 +1172,17 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
     this.finalTraits={dr:new Set(),di:new Set(),dv:new Set(),ci:new Set(),languages:new Set(),tools:new Set(),senses:{darkvision:"",blindsight:"",tremorsense:"",truesight:""}};
     this.traitsSignature=null; this.spellLevelFilter="all"; this._low=new Set(); this.confirmed=new Set();
     this.remembered=new Set(); this.savedFrom=null; this._pendingSpells=null; this.targetActorId=""; this.sourceText="";
+    this.prepared=false; this.limitWarned=null; this._docCache=new Map(); this._detectedTraits=null; this._savedTraitEdits=null; this._ovSkills=false;
   }
   async _renderHTML(){ const root=document.createElement("div"); root.className="cbi"; root.innerHTML=this.view(); return root; }
   _replaceHTML(result,content){ content.replaceChildren(result); this.bind(content); }
   /** Re-render without jumping back to the top of the step. */
-  async rerender(){ const top=this.element?.querySelector(".cbi-body")?.scrollTop||0; await this.render(); const body=this.element?.querySelector(".cbi-body"); if(body) body.scrollTop=top; }
-  setBusy(msg=""){ this.busy=msg; const el=this.element?.querySelector(".cbi-busy"); if(el) el.textContent=msg; this.element?.querySelectorAll("[data-act]").forEach(b=>b.disabled=!!msg||(b.dataset.act==="next"&&!this.data)); }
+  async rerender(){
+    const keep=[".cbi-body",".source-grid",".spell-list",".ov-warn-list"]; const tops=keep.map(q=>this.element?.querySelector(q)?.scrollTop||0);
+    await this.render();
+    keep.forEach((q,i)=>{ const el=this.element?.querySelector(q); if(el) el.scrollTop=tops[i]; });
+  }
+  setBusy(msg=""){ this.busy=msg; const el=this.element?.querySelector(".cbi-busy"); if(el) el.textContent=msg; this.element?.querySelectorAll("[data-act]").forEach(b=>b.disabled=!!msg||(b.dataset.act==="next"&&!this.data)||b.dataset.blocked==="1"||(b.dataset.act==="create"&&this.creating)); }
   /** Hit die per class from the matched class documents, e.g. {psion: 6}. */
   hitDiceByClass(){ const out={}; for(const x of this.coreDocs||[]) if(x.kind==="class"){ const n=parseInt(String(x.doc?.system?.hd?.denomination||x.doc?.system?.hitDice||"").replace(/^d/i,""),10); if(n) out[norm(x.name)]=n; } return out; }
   characterLevel(){ return Number(this.data?.Level||0)||defaultClassOrder(this.data||{}).length||1; }
@@ -1212,6 +1263,21 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
     for(const src of [...this.coreDocs,...this.featDocs]) scanDoc(src.doc);
     for(const f of uniqueFeatNames(this.data)){const u=this.matches.get(`feat:${f}`);if(u&&!String(u).startsWith("__"))scanDoc(await this.docData(u));}
     const owned=flattenOwned(this.data);for(let i=0;i<owned.length;i++){const u=this.matches.get(`eq:${i}`);if(u&&!String(u).startsWith("__"))scanDoc(await this.docData(u));}
+    this._detectedTraits=this.cloneTraits(this.finalTraits);
+    this.applyTraitEdits(this._savedTraitEdits);
+  }
+  cloneTraits(t){ const out={senses:{...t.senses}}; for(const k of TRAIT_SETS) out[k]=new Set(t[k]); return out; }
+  /** What was changed by hand on the Traits step, relative to what was detected. Saved so a re-import applies it again. */
+  traitEdits(){
+    const det=this._detectedTraits; if(!det) return null; const out={added:{},removed:{},senses:{}};
+    for(const k of TRAIT_SETS){ const a=[...this.finalTraits[k]].filter(v=>!det[k].has(v)), r=[...det[k]].filter(v=>!this.finalTraits[k].has(v)); if(a.length) out.added[k]=a; if(r.length) out.removed[k]=r; }
+    for(const k of SENSE_TYPES) if(String(this.finalTraits.senses[k]||"")!==String(det.senses[k]||"")) out.senses[k]=String(this.finalTraits.senses[k]||"");
+    return out;
+  }
+  applyTraitEdits(e){
+    if(!e||typeof e!=="object") return;
+    for(const k of TRAIT_SETS){ for(const v of (e.added?.[k]||[])) this.finalTraits[k].add(v); for(const v of (e.removed?.[k]||[])) this.finalTraits[k].delete(v); }
+    for(const k of SENSE_TYPES) if(e.senses&&k in e.senses) this.finalTraits.senses[k]=e.senses[k];
   }
   traitChecklist(title,kind,options){const set=this.finalTraits[kind];const known=new Set(options.map(o=>typeof o==="string"?o:o.value));const extra=[...set].filter(v=>!known.has(v));return `<div class="trait-editor-group"><h4>${title}</h4><div class="trait-grid">${[...options,...extra].map(o=>{const value=typeof o==="string"?o:o.value,label=typeof o==="string"?o.replace(/\b\w/g,c=>c.toUpperCase()):o.label;return `<label><input type="checkbox" data-final-trait="${kind}" value="${esc(value)}" ${set.has(traitKey(value))?'checked':''}> ${esc(label)}</label>`;}).join("")}</div></div>`;}
   finalTraitsView(){
@@ -1219,7 +1285,7 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
     const allLang=new Set(Object.values(groups).flat().map(([,v])=>v)); const extraLang=[...this.finalTraits.languages].filter(v=>!allLang.has(v)).map(v=>({label:languageLabel(v),value:v}));
     const langGrid=opts=>`<div class="trait-grid">${opts.map(o=>`<label><input type="checkbox" data-final-trait="languages" value="${esc(o.value)}" ${this.finalTraits.languages.has(traitKey(o.value))?'checked':''}> ${esc(o.label)}</label>`).join("")}</div>`;
     const tools=TOOL_OPTIONS_2024.map(([label,value])=>({label,value}));
-    return `<section><h2>Final Traits</h2><p>Detected values are preselected. Add or remove anything needed before the actor is created. Changing earlier choices re-detects this page.</p>${this.traitChecklist("Damage Resistances","dr",DAMAGE_TYPES)}${this.traitChecklist("Damage Immunities","di",DAMAGE_TYPES)}${this.traitChecklist("Damage Vulnerabilities","dv",DAMAGE_TYPES)}${this.traitChecklist("Condition Immunities","ci",CONDITION_TYPES)}<div class="trait-editor-group"><h4>Senses</h4><div class="sense-grid">${SENSE_TYPES.map(k=>`<label>${k.replace(/\b\w/g,c=>c.toUpperCase())} <input type="number" min="0" data-final-sense="${k}" value="${esc(this.finalTraits.senses[k]||"")}" placeholder="ft"></label>`).join("")}</div></div><div class="trait-editor-group"><h4>Languages</h4><h5>Standard Languages</h5>${langGrid(toOpts(groups.standard))}<h5>Exotic Languages</h5>${langGrid(toOpts(groups.exotic))}${groups.special.length?`<h5>Secret Languages</h5>${langGrid(toOpts(groups.special))}`:""}${extraLang.length?`<h5>Other Detected</h5>${langGrid(extraLang)}`:""}</div><div class="trait-editor-group"><h4>Tool Proficiencies</h4><p class="muted">Select every tool proficiency the character should have. Unticking a detected tool removes it.</p><div class="trait-grid tool-grid">${tools.map(o=>`<label><input type="checkbox" data-final-trait="tools" value="${esc(o.value)}" ${this.finalTraits.tools.has(traitKey(o.value))?'checked':''}> ${esc(o.label)}</label>`).join("")}</div></div></section>`;
+    return `<section><h2>Traits</h2><p>Detected values are preselected. Add or remove anything needed before the actor is created. Changing earlier choices re-detects this page.</p>${this.traitChecklist("Damage Resistances","dr",DAMAGE_TYPES)}${this.traitChecklist("Damage Immunities","di",DAMAGE_TYPES)}${this.traitChecklist("Damage Vulnerabilities","dv",DAMAGE_TYPES)}${this.traitChecklist("Condition Immunities","ci",CONDITION_TYPES)}<div class="trait-editor-group"><h4>Senses</h4><div class="sense-grid">${SENSE_TYPES.map(k=>`<label>${k.replace(/\b\w/g,c=>c.toUpperCase())} <input type="number" min="0" data-final-sense="${k}" value="${esc(this.finalTraits.senses[k]||"")}" placeholder="ft"></label>`).join("")}</div></div><div class="trait-editor-group"><h4>Languages</h4><h5>Standard Languages</h5>${langGrid(toOpts(groups.standard))}<h5>Exotic Languages</h5>${langGrid(toOpts(groups.exotic))}${groups.special.length?`<h5>Secret Languages</h5>${langGrid(toOpts(groups.special))}`:""}${extraLang.length?`<h5>Other Detected</h5>${langGrid(extraLang)}`:""}</div><div class="trait-editor-group"><h4>Tool Proficiencies</h4><p class="muted">Select every tool proficiency the character should have. Unticking a detected tool removes it.</p><div class="trait-grid tool-grid">${tools.map(o=>`<label><input type="checkbox" data-final-trait="tools" value="${esc(o.value)}" ${this.finalTraits.tools.has(traitKey(o.value))?'checked':''}> ${esc(o.label)}</label>`).join("")}</div></div></section>`;
   }
 
   async prepareCharacterMetadata(){
@@ -1242,6 +1308,7 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
       await this.rebuildChoiceDefs();
       await this.buildGrantedSpells();
       await this.rebuildFeaturePlacementDefs();
+      this.prepared=true;
     } finally { this.setBusy(""); }
   }
   /** Advancement choice definitions for species, classes, subclasses and every matched feat. */
@@ -1257,16 +1324,16 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
       if(hits.length) this.advChoices.set(d.id,hits.map(o=>o.value));
     }
   }
-  /** Feats whose own advancements must run: the server Origin feat, bot feats, and feats picked through advancement choices. */
   /** Default database matches for the bot's feats (exact name for the Origin feat, best candidate otherwise). */
   ensureFeatMatches(){
     const origin=getOriginFeat(this.data);
     for(const f of uniqueFeatNames(this.data)){
       const id=`feat:${f}`; if(this.matches.has(id)) continue;
       if(norm(f)===norm(origin)){ const exact=this.featSearchCandidates(origin,true).find(r=>r._searchScore>=120); if(exact) this.matches.set(id,exact.uuid); }
-      else { const top=this.matchCandidates(f,["feat"])[0]; this.matches.set(id,top?.uuid||"__placeholder__"); }
+      else { const top=this.matchCandidates(f,["feat"])[0]; this.matches.set(id,top?.uuid||"__placeholder__"); if(top&&top.score<MATCH_CONFIDENT&&!this.confirmed.has(id)) this.lowConfidence.add(id); }
     }
   }
+  /** Feats whose own advancements must run: the server Origin feat, bot feats, and feats picked through advancement choices. */
   async buildFeatDocs(){
     this.ensureFeatMatches();
     const out=[], seen=new Set(), level=this.characterLevel();
@@ -1281,18 +1348,18 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
       const base={id:`${src.kind}:${src.name}:${adv._id}`,sourceKind:src.kind,sourceName:src.doc?.name||src.name,level:Number(adv.level??0),mode:adv.configuration?.mode||"default",isMagicInitiate:/^magic initiate/i.test(String(src.doc?.name||""))};
       if(adv.type==="Trait" && traitChoiceCount(adv)>0){
         const pool=[...new Set((adv.configuration?.choices||[]).flatMap(c=>c.pool||[]))];
-        const isMastery=base.mode==="mastery"||/weapon\s*mastery/i.test(String(adv.title||""))||(pool.length>0&&pool.every(x=>/weapon.*master/i.test(String(x).split(":")[0])));
+        const isMastery=base.mode==="mastery"||/weapon\s*mastery/i.test(String(advTitle(adv)||""))||(pool.length>0&&pool.every(x=>/weapon.*master/i.test(String(x).split(":")[0])));
         let options;
         if(isMastery){ options=weaponMasteryPoolOptions(pool,true); if(!options?.length) options=weaponMasteryPoolOptions(["*"],true); }
         else options=expandTraitPool(pool);
-        const title=adv.title||(base.mode==="expertise"?"Expertise":"Trait Choice");
+        const title=advTitle(adv)||(base.mode==="expertise"?"Expertise":"Trait Choice");
         defs.push({...base,type:isMastery?"weapon-mastery":"trait",title,count:traitChoiceCount(adv),options});
       }else if(adv.type==="ItemChoice"){
         const count=itemChoiceCount(adv,src.level); if(!count)continue;
         const restriction=adv?.configuration?.restriction||{};
         if(restriction.type==="feat" && restriction.subtype==="origin"){
-          defs.push({...base,type:"origin-search",title:adv.title||"Origin Feat",count,options:[]});
-        }else if(/fighting\s*style/i.test(String(adv.title||""))){
+          defs.push({...base,type:"origin-search",title:advTitle(adv)||"Origin Feat",count,options:[]});
+        }else if(/fighting\s*style/i.test(String(advTitle(adv)||""))){
           // Merge the advancement's own pool with indexed and raw-UA Fighting Style feats.
           // Resolve relative advancement UUID labels against the owning class/subclass document.
           const native=await resolveChoicePool(adv);
@@ -1302,12 +1369,12 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
             const d=await this.advancementDocData(src.doc,uuid);if(!d?.name)continue;
             const hit=native.find(x=>x.uuid===uuid);if(hit)hit.name=d.name;else native.push({uuid,name:d.name});
           }
-          defs.push({...base,type:"fighting-style",title:adv.title||"Fighting Style",count,options:fightingStyleOptions(native)});
+          defs.push({...base,type:"fighting-style",title:advTitle(adv)||"Fighting Style",count,options:fightingStyleOptions(native)});
         }else{
           let opts=(await resolveChoicePool(adv)).map(x=>({value:x.uuid,label:x.name}));
           let type="item";
           if(!opts.length&&restriction.type==="spell"){ opts=this.spellChoiceOptions(restriction,base.isMagicInitiate); type="spell-choice"; }
-          defs.push({...base,type,title:adv.title||"Feature Choice",count,options:opts,spellConfig:adv.configuration?.spell||null});
+          defs.push({...base,type,title:advTitle(adv)||"Feature Choice",count,options:opts,spellConfig:adv.configuration?.spell||null});
         }
       }
     }
@@ -1338,14 +1405,19 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
     for(const e of rows){const label=originChoiceCanonicalName(e.name),src=String(e.plutonium?.source||e.source?.book||"");const k=`${norm(label)}|${norm(src)}`;if(!label||seen.has(k))continue;seen.add(k);out.push({...e,displayName:label});if(out.length>=30)break;}
     return out;
   }
-  featEntryById(id){const synth=syntheticFightingStyleName(id);if(synth)return {name:synth,type:"feat",uuid:id,source:{book:"Fighting Style fallback",rules:"2024"}};return resolver.entries.find(e=>e.uuid===id)||resolver.excludedEntries.find(e=>e.uuid===id)||(String(id||"").startsWith("__rawfeat__")?plutoniumBridge.rawFeatEntry(plutoniumBridge.rawFeatFromId(id)||{}):null);}
+  featEntryById(id){const synth=syntheticFightingStyleName(id);if(synth)return {name:synth,type:"feat",uuid:id,source:{book:"Fighting Style fallback",rules:"2024"}};return resolver.getAny(id)||(String(id||"").startsWith("__rawfeat__")?plutoniumBridge.rawFeatEntry(plutoniumBridge.rawFeatFromId(id)||{}):null);}
   sourceGroupLabel(kind){ return ({race:"Species Features",class:"Class Features",subclass:"Subclass Features",feat:"Feat Choices"})[kind]||"Other Features"; }
   choiceHeading(def){ const lvl=Number(def.level||0); return `${esc(def.title)}${def.mode==="expertise"?' <span class="adv-level">Expertise</span>':""}${lvl>0?` <span class="adv-level">Level ${lvl}</span>`:""}`; }
   choiceSelectionLabels(def){
     const sel=this.advChoices.get(def.id)||[];
-    return sel.map(v=>{ const o=def.options?.find(x=>x.value===v); if(o?.label)return o.label; const e=resolver.entries.find(x=>x.uuid===v); if(e?.name)return originChoiceCanonicalName(e.name); return traitLabel(v)||String(v); });
+    return sel.map(v=>{ const o=def.options?.find(x=>x.value===v); if(o?.label)return o.label; const e=resolver.get(v); if(e?.name)return originChoiceCanonicalName(e.name); return traitLabel(v)||String(v); });
   }
   requiredCount(def){ return def.type==="origin-search"?def.count:Math.min(def.count,def.options?.length||0); }
+  /** True when the bot lists Resilient and no matched feat document asks for its saving throw itself. */
+  needsResilientSave(){
+    if(!this.data||!uniqueFeatNames(this.data).some(f=>norm(f)==="resilient")) return false;
+    return !this.advChoiceDefs.some(d=>d.sourceKind==="feat"&&/resilient/i.test(d.sourceName)&&d.options.some(o=>String(o.value).startsWith("saves:")));
+  }
   advancementGroupsView(){
     const order=["race","class","subclass","feat","other"]; const groups=new Map();
     for(const d of this.advChoiceDefs){ const k=order.includes(d.sourceKind)?d.sourceKind:"other"; if(!groups.has(k))groups.set(k,[]); groups.get(k).push(d); }
@@ -1353,7 +1425,7 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
   }
   originSearchBlock(def){
     const sel=this.advChoices.get(def.id)||[]; const selected=sel[0]?this.featEntryById(sel[0]):null;
-    const q=this.advSearch.get(def.id)||""; const results=this.featSearchCandidates(q,true);
+    const q=this.advSearch.get(def.id)||"";
     return `<div class="adv-choice origin-search-choice"><h4>${this.choiceHeading(def)} <small>Choose ${def.count}</small></h4><div class="choice-placement">${this.choicePlacementSelect(def)}</div><p class="muted">Type the feat name to search every indexed 2024 feat from the enabled sources, then choose the result that is legal on your server.</p><div class="origin-selected" data-origin-selected="${esc(def.id)}">${selected?`<b>Selected:</b> ${esc(originChoiceCanonicalName(selected.name))}<small>${esc(selected.plutonium?.source||selected.source?.book||selected.uuid)}</small>`:`<b>No feat selected.</b>`}</div><input class="search" data-origin-search="${esc(def.id)}" value="${esc(q)}" placeholder="Search feat name, e.g. Mark of Warding"><div class="origin-results" data-origin-results="${esc(def.id)}"></div></div>`;
   }
   magicInitiateSelect(){ return `<div class="form-row mi-row"><label>Magic Initiate spell list</label><select data-magic-initiate-list>${["cleric","druid","wizard"].map(v=>`<option value="${v}" ${this.magicInitiateList===v?'selected':''}>${v[0].toUpperCase()+v.slice(1)}</option>`).join("")}</select></div>`; }
@@ -1365,28 +1437,29 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
     const help=this.choiceHelp(def);
     return `<div class="adv-choice" data-choice-def="${esc(def.id)}"><h4>${this.choiceHeading(def)} <small>Choose ${def.count}</small> <span class="choice-help" title="${esc(help)}" aria-label="${esc(help)}" tabindex="0"><i class="fa-solid fa-circle-question"></i></span></h4><div class="choice-placement">${this.choicePlacementSelect(def)}</div><p class="choice-instructions">${esc(help)}</p>${def.isMagicInitiate&&def.type==="spell-choice"?this.magicInitiateSelect():""}${empty}<div class="skill-grid">${def.options.map(o=>`<label title="Select ${esc(o.label)} for ${esc(def.title||'this feature')}"><input data-adv-choice="${esc(def.id)}" value="${esc(o.value)}" type="checkbox" ${sel.includes(o.value)?'checked':''} ${!sel.includes(o.value)&&sel.length>=required?'disabled':''}> ${esc(o.label)}</label>`).join("")}</div>${mi?`<div data-mi-wrap="${esc(def.id)}" style="${miSelected?'':'display:none'}">${this.magicInitiateSelect()}</div>`:""}</div>`;
   }
-  view(){ const heads=["Upload","Core & HP","Skills & Feats","Spells","Equipment","Final Traits","Review"]; return `<div class="cbi-steps">${heads.map((h,i)=>`<div class="${i===this.step?'active':''} ${i<this.step?'done':''}">${i+1}. ${h}</div>`).join("")}</div><div class="cbi-body">${[this.uploadView,this.coreView,this.choiceView,this.spellView,this.equipView,this.finalTraitsView,this.reviewView][this.step].call(this)}</div><div class="cbi-nav">${this.step?`<span class="nav-left"><button type="button" data-act="back"><i class="fa-solid fa-arrow-left"></i> Back</button>${this.data?'<button type="button" data-act="overview">Overview</button>':""}</span>`:'<span></span>'}<span class="cbi-busy" role="status">${esc(this.busy)}</span>${this.step<6?`<button type="button" data-act="next" ${!this.data||this.busy?'disabled':''}>Next <i class="fa-solid fa-arrow-right"></i></button>`:`<button type="button" class="create" data-act="create" ${this.creating?'disabled':''}><i class="fa-solid ${this.targetActorId?"fa-arrows-rotate":"fa-user-plus"}"></i> ${this.targetActorId?"Update Actor":"Create Actor"}</button>`}</div>`; }
+  view(){ const heads=STEP_NAMES; return `<div class="cbi-steps">${heads.map((h,i)=>`<div class="${i===this.step?'active':''} ${i<this.step?'done':''}" ${this.data&&i!==this.step?`data-goto-step="${i}" role="button" tabindex="0" title="Go to ${h}"`:""}>${i+1}. ${h}</div>`).join("")}</div><div class="cbi-body">${[this.uploadView,this.coreView,this.choiceView,this.spellView,this.equipView,this.finalTraitsView,this.reviewView][this.step].call(this)}</div><div class="cbi-nav">${this.step?`<span class="nav-left"><button type="button" data-act="back"><i class="fa-solid fa-arrow-left"></i> Back</button>${this.data?'<button type="button" data-act="overview">Overview</button>':""}</span>`:'<span></span>'}<span class="cbi-busy" role="status">${esc(this.busy)}</span>${this.step<6?`<button type="button" data-act="next" ${!this.data||this.busy?'disabled':''}>Next <i class="fa-solid fa-arrow-right"></i></button>`:`<button type="button" class="create" data-act="create" ${this.creating?'disabled':''}><i class="fa-solid ${this.targetActorId?"fa-arrows-rotate":"fa-user-plus"}"></i> ${this.targetActorId?"Update Actor":"Create Actor"}</button>`}</div>`; }
   sourceFilterView(){
     const merged=new Map();for(const x of [...resolver.plutoniumSources(),...plutoniumBridge.rawFeatSources()])merged.set(x.code,(merged.get(x.code)||0)+x.count);const sources=[...merged.entries()].map(([code,count])=>({code,count})).sort((a,b)=>a.code.localeCompare(b.code)); if(!sources.length)return"";
     if(this.enabledSources===null){ this.enabledSources=new Set(sources.map(x=>x.code)); resolver.setEnabledPlutoniumSources(this.enabledSources); }
     const q=norm(this.sourceSearch); const shown=sources.filter(x=>!q||norm(x.code).includes(q));
-    return `<details class="source-filter" ${this.data?'':'open'}><summary>5etools / Plutonium Sources <small>${this.enabledSources.size}/${sources.length} enabled</small></summary><p class="muted">Native dnd5e 2024 content is always available. These switches control Plutonium/5etools material used for feats, spells, items, subclasses, and matching.</p><div class="source-toolbar"><input class="search" data-source-search value="${esc(this.sourceSearch)}" placeholder="Filter source codes…"><button type="button" data-source-all>Enable All</button><button type="button" data-source-none>Disable All</button></div><div class="source-grid">${shown.map(x=>`<label data-source-row="${esc(norm(x.code))}"><input type="checkbox" data-source-code="${esc(x.code)}" ${this.enabledSources.has(x.code)?"checked":""}><span>${esc(sourceDisplayName(x.code))}</span><small>${x.count}</small></label>`).join("")}</div></details>`;
+    return `<details class="source-filter" ${(this.sourcesOpen??!this.data)?'open':''}><summary>5etools / Plutonium Sources <small>${this.enabledSources.size}/${sources.length} enabled</small></summary><p class="muted">Native dnd5e 2024 content is always available. These switches control Plutonium/5etools material used for feats, spells, items, subclasses, and matching.</p><div class="source-toolbar"><input class="search" data-source-search value="${esc(this.sourceSearch)}" placeholder="Filter source codes…"><button type="button" data-source-all>Enable All</button><button type="button" data-source-none>Disable All</button></div><div class="source-grid">${shown.map(x=>`<label data-source-row="${esc(norm(x.code))}"><input type="checkbox" data-source-code="${esc(x.code)}" ${this.enabledSources.has(x.code)?"checked":""}><span>${esc(sourceDisplayName(x.code))}</span><small>${x.count}</small></label>`).join("")}</div></details>`;
   }
   /** Everything chosen in the wizard, saved on the actor so a re-import or level-up starts from it. */
   snapshotChoices(){
-    const owned=flattenOwned(this.data||{}); const equipment={};
+    const owned=flattenOwned(this.data||{}); const equipment=[];
     owned.forEach((x,i)=>{ const id=`eq:${i}`, st=this.equipment.get(id)||{}, rec={};
       if(this.confirmed.has(id)||this.remembered.has(id)) rec.uuid=this.matches.get(id)||"";
       if("equipped" in st) rec.equipped=!!st.equipped; if("attuned" in st) rec.attuned=!!st.attuned;
-      if(Object.keys(rec).length) equipment[x.key]=rec; });
+      if(Object.keys(rec).length) equipment.push([x.key,rec]); });
     const sets=k=>[...this.finalTraits[k]];
-    return { module:moduleVersion(), savedAt:Date.now(), level:this.characterLevel(), skills:[...this.skills], classOrder:[...this.classOrder], hpOverride:this.hpOverride||"",
-      featMatches:Object.fromEntries([...this.matches].filter(([k])=>k.startsWith("feat:"))), equipment,
-      spells:[...this.spells], spellClassAssignments:Object.fromEntries(this.spellClassAssignments), advChoices:Object.fromEntries(this.advChoices),
-      magicInitiateList:this.magicInitiateList, casterProfiles:Object.fromEntries([...this.casterProfiles].map(([k,p])=>[k,{progression:p.progression,ability:p.ability,maxOverride:p.maxOverride??""}])),
-      speciesUuid:this.speciesUuid||"", featurePlacements:Object.fromEntries(this.featurePlacements), choicePlacements:Object.fromEntries(this.choicePlacements),
+    return { format:2, module:moduleVersion(), savedAt:Date.now(), level:this.characterLevel(), skills:[...this.skills], classOrder:[...this.classOrder], hpOverride:this.hpOverride||"",
+      featMatches:[...this.matches].filter(([k])=>k.startsWith("feat:")), equipment,
+      spells:[...this.spells], spellClassAssignments:[...this.spellClassAssignments], advChoices:[...this.advChoices],
+      magicInitiateList:this.magicInitiateList, casterProfiles:[...this.casterProfiles].map(([k,p])=>[k,{progression:p.progression,ability:p.ability,maxOverride:p.maxOverride??""}]),
+      speciesUuid:this.speciesUuid||"", featurePlacements:[...this.featurePlacements], choicePlacements:[...this.choicePlacements],
       resilientSave:this.resilientSave||"", featBonusesInStats:!!this.data?.__featBonusesInStats,
-      finalTraits:{dr:sets("dr"),di:sets("di"),dv:sets("dv"),ci:sets("ci"),languages:sets("languages"),tools:sets("tools"),senses:{...this.finalTraits.senses}} };
+      finalTraits:{dr:sets("dr"),di:sets("di"),dv:sets("dv"),ci:sets("ci"),languages:sets("languages"),tools:sets("tools"),senses:{...this.finalTraits.senses}},
+      traitEdits:this.traitEdits() };
   }
   /** Restore a snapshot before matching runs. Choices whose source no longer exists are dropped by the normal rebuild. */
   applySavedChoices(saved){
@@ -1402,37 +1475,43 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
     }
     if(saved.hpOverride&&Number(saved.level)===this.characterLevel()) this.hpOverride=saved.hpOverride;
     const feats=new Set(uniqueFeatNames(this.data).map(f=>`feat:${f}`));
-    for(const [k,v] of Object.entries(saved.featMatches||{})) if(feats.has(k)&&v){ this.matches.set(k,v); this.confirmed.add(k); }
+    for(const [k,v] of fromPairs(saved.featMatches)) if(feats.has(k)&&v){ this.matches.set(k,v); this.confirmed.add(k); }
     if(saved.featBonusesInStats) Object.defineProperty(this.data,"__featBonusesInStats",{value:true,enumerable:false,writable:true,configurable:true});
     if(saved.speciesUuid) this.speciesUuid=saved.speciesUuid;
     if(saved.magicInitiateList) this.magicInitiateList=saved.magicInitiateList;
     if(saved.resilientSave) this.resilientSave=saved.resilientSave;
-    for(const [k,v] of Object.entries(saved.advChoices||{})) if(Array.isArray(v)&&v.length) this.advChoices.set(k,[...v]);
-    for(const [k,v] of Object.entries(saved.featurePlacements||{})) this.featurePlacements.set(k,v);
-    for(const [k,v] of Object.entries(saved.choicePlacements||{})) this.choicePlacements.set(k,v);
-    for(const [cn,p] of Object.entries(saved.casterProfiles||{})) if(this.data.Class?.[cn]&&p) this.casterProfiles.set(cn,{progression:p.progression,ability:p.ability,maxOverride:p.maxOverride??""});
-    flattenOwned(this.data).forEach((x,i)=>{ const r=saved.equipment?.[x.key]; if(!r) return; const id=`eq:${i}`;
+    for(const [k,v] of fromPairs(saved.advChoices)) if(Array.isArray(v)&&v.length) this.advChoices.set(k,[...v]);
+    for(const [k,v] of fromPairs(saved.featurePlacements)) this.featurePlacements.set(k,v);
+    for(const [k,v] of fromPairs(saved.choicePlacements)) this.choicePlacements.set(k,v);
+    for(const [cn,p] of fromPairs(saved.casterProfiles)) if(this.data.Class?.[cn]&&p) this.casterProfiles.set(cn,{progression:p.progression,ability:p.ability,maxOverride:p.maxOverride??""});
+    if(saved.traitEdits) this._savedTraitEdits=saved.traitEdits;
+    const savedEquipment=new Map(fromPairs(saved.equipment));
+    flattenOwned(this.data).forEach((x,i)=>{ const r=savedEquipment.get(x.key); if(!r) return; const id=`eq:${i}`;
       if(r.uuid){ this.matches.set(id,r.uuid); this.confirmed.add(id); }
       const st={}; if("equipped" in r) st.equipped=!!r.equipped; if("attuned" in r) st.attuned=!!r.attuned; if(Object.keys(st).length) this.equipment.set(id,st); });
-    this._pendingSpells={spells:Array.isArray(saved.spells)?saved.spells:[],assign:saved.spellClassAssignments||{}};
+    this._pendingSpells={spells:Array.isArray(saved.spells)?saved.spells:[],assign:new Map(fromPairs(saved.spellClassAssignments))};
     return true;
   }
   restorePendingSpells(){
     const p=this._pendingSpells; this._pendingSpells=null; if(!p) return;
-    const known=new Set(resolver.entries.map(e=>e.uuid));
-    for(const u of p.spells) if(known.has(u)){ this.spells.add(u); const cn=p.assign[u]; if(cn&&this.data.Class?.[cn]) this.spellClassAssignments.set(u,cn); }
+    for(const u of p.spells) if(resolver.get(u)){ this.spells.add(u); const cn=p.assign.get(u); if(cn&&this.data.Class?.[cn]) this.spellClassAssignments.set(u,cn); }
   }
   /** Characters this user may update: their own player characters. Backups are never offered automatically. */
   updateCandidates(){ return (game.actors?.contents||[...(game.actors||[])]).filter(a=>a.type==="character"&&(a.isOwner??true)); }
   findExistingActor(){
     const name=norm(this.data?.Name||""); if(!name) return null;
     const cs=this.updateCandidates().filter(a=>a.flags?.[MODULE_ID]&&!a.flags[MODULE_ID].backupOf);
-    return cs.find(a=>norm(a.flags[MODULE_ID].rawExport?.Name||"")===name)||cs.find(a=>norm(a.name)===name)||null;
+    return cs.find(a=>norm(a.flags[MODULE_ID].exportName||a.flags[MODULE_ID].rawExport?.Name||"")===name)||cs.find(a=>norm(a.name)===name)||null;
   }
   /** Read an export, pick the character to update (if any), restore its saved choices and match everything. */
   async loadExport(text,fileName,{targetId}={}){
     const data=parseBotExport(text); if(!data||typeof data!=="object"||!Object.keys(data.Class||{}).length) throw new Error("This file has no Class section. Choose a D&D Friends bot export.");
     this.resetForNewExport(); this.data=data; this.fileName=fileName; this.sourceText=text; this.classOrder=defaultClassOrder(this.data); await this.render();
+    try{ await this.matchExport(targetId); }
+    catch(err){ this.resetForNewExport(); this.setBusy(""); await this.render(); throw err; }
+    await this.render();
+  }
+  async matchExport(targetId){
     this.setBusy("Indexing compendiums and world items…"); await resolver.load();
     this.setBusy("Loading feat data…"); await plutoniumBridge.buildFeatIndex();
     const allSrc=[...new Set([...resolver.plutoniumSources().map(x=>x.code),...plutoniumBridge.rawFeatSources().map(x=>x.code)])]; if(this.enabledSources===null)this.enabledSources=new Set(allSrc); else this.enabledSources=new Set([...this.enabledSources].filter(x=>allSrc.includes(x))); resolver.setEnabledPlutoniumSources(this.enabledSources);
@@ -1440,7 +1519,6 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
     this.targetActorId=target?.id||"";
     const saved=target?.getFlag?.(MODULE_ID,"choices"); if(saved) this.applySavedChoices(saved);
     await this.prepareCharacterMetadata(); this.restorePendingSpells();
-    await this.render();
   }
   targetActor(){ return this.targetActorId?game.actors?.get(this.targetActorId)||null:null; }
   targetView(){
@@ -1471,8 +1549,11 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
     for(const d of this.advChoiceDefs){ const have=(this.advChoices.get(d.id)||[]).length, need=this.requiredCount(d);
       if(have<need) go(block,`${d.sourceName} — ${d.title}: choose ${need-have} more`,2); else if(need) go(done,`${d.sourceName} — ${d.title}`,2);
       if(need<d.count) go(warn,`${d.sourceName} — ${d.title}: only ${need} of ${d.count} options found; finish on the sheet`,2); }
+    if(this.needsResilientSave()){ if(!this.resilientSave) go(block,"Resilient: choose the saving throw it makes proficient",2); else go(done,`Resilient: ${ABILITY_LABELS[this.resilientSave]||this.resilientSave} saving throw`,2); }
     if(!block.some(b=>b.step===2)){ const problem=this.validateChoices(); if(problem) go(block,problem,2); }
-    for(const f of uniqueFeatNames(this.data)){ if(norm(f)===norm(origin)) continue; const u=this.matches.get(`feat:${f}`); if(u==="__placeholder__") go(warn,`Feat “${f}” will be a placeholder`,2); }
+    for(const f of uniqueFeatNames(this.data)){ if(norm(f)===norm(origin)) continue; const u=this.matches.get(`feat:${f}`);
+      if(u==="__placeholder__") go(warn,`Feat “${f}” will be a placeholder`,2);
+      else if(this.lowConfidence.has(`feat:${f}`)) go(warn,`Feat “${f}”: check the match (${this.featEntryById(u)?.name||"?"})`,2); }
     // Spells
     for(const [cn,r] of this.spellTally()){ if(cn==="Unassigned") continue; const lim=this.spellLimitsFor(cn);
       if(!r.c&&!r.l){ if(this.targetActorId) go(done,`${cn}: no new spells chosen (spells already on the sheet are kept)`,3); else go(warn,`${cn}: no spells chosen yet${lim?` (up to ${lim.cantrips??0} cantrips, ${lim.prepared??"?"} prepared)`:""}`,3); }
@@ -1484,7 +1565,9 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
     owned.forEach((x,i)=>{ const id=`eq:${i}`, u=this.matches.get(id);
       if(!u||u==="__placeholder__") go(warn,`${x.name}: no match, will be a placeholder`,4);
       else if(this.lowConfidence.has(id)) go(warn,`${x.name}: check the match (${this.itemEntryFor(u)?.name||"?"})`,4);
-      else { matched++; if(String(u).startsWith("__rawitem__")) raw++; else if(this.itemEntryFor(u)?.legacy||resolver.excludedEntries.some(e=>e.uuid===u)) legacy++; } });
+      else { matched++; if(String(u).startsWith("__rawitem__")) raw++; else if(this.itemEntryFor(u)?.legacy||resolver.excludedByUuid.has(u)) legacy++; } });
+    const defaults=this.defaultEquipment(owned); const attuned=owned.filter((x,i)=>{ const st=this.equipState(i,x,defaults); return st.attuned&&Number(st.qty)>0; }).length;
+    if(attuned>3) go(warn,`${attuned} items are attuned; the usual limit is 3`,4);
     if(owned.length) go(done,`${matched} of ${owned.length} items matched${raw?`, ${raw} from 5etools`:""}${legacy?`, ${legacy} from 2014 sources`:""}${this.remembered.size?`, ${this.remembered.size} from remembered picks`:""}`,4);
     const t=this.targetActor(); if(t){ const from=Number(t.system?.details?.level||0); go(done,`Updating ${t.name}${from?`: level ${from} → ${this.characterLevel()}`:""}`,0); }
     go(done,"Resistances, senses, languages and tools are detected from your choices",5);
@@ -1492,27 +1575,27 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
   }
   overviewView(){
     const {block,warn,done}=this.importStatus();
-    const row=(r,cls)=>r.step===0?`<li class="${cls}"><span>${esc(r.text)}</span></li>`:`<li class="${cls}"><span>${esc(r.text)}</span><button type="button" class="link-button" data-goto-step="${r.step}">${["","Character","Choices","Spells","Equipment","Traits"][r.step]||"Open"} →</button></li>`;
+    const row=(r,cls)=>r.step===0?`<li class="${cls}"><span>${esc(r.text)}</span></li>`:`<li class="${cls}"><span>${esc(r.text)}</span><button type="button" class="link-button" data-goto-step="${r.step}">${STEP_NAMES[r.step]||"Open"} →</button></li>`;
     const t=this.targetActor(); const verb=t?`Update ${esc(t.name)}`:"Create character";
     return `<div class="overview">
       ${this.targetView()}
       <h3>${block.length?`${block.length} thing${block.length===1?"":"s"} to choose before importing`:"Ready to import"}</h3>
       ${block.length?`<ul class="ov-list ov-block">${block.map(r=>row(r,"ov-block")).join("")}</ul>`:""}
-      ${this.skills.length!==2?`<div class="ov-skills"><small class="muted">Pick the 2 free skills here:</small><div class="skill-grid">${Object.entries(SKILLS).map(([k,v])=>`<label><input data-skill value="${k}" type="checkbox" ${this.skills.includes(k)?'checked':''} ${!this.skills.includes(k)&&this.skills.length>=2?'disabled':''}> ${v}</label>`).join("")}</div></div>`:""}
+      ${this.skills.length!==2||this._ovSkills?`<div class="ov-skills"><small class="muted">Pick the 2 free skills here:</small><div class="skill-grid">${Object.entries(SKILLS).map(([k,v])=>`<label><input data-skill value="${k}" type="checkbox" ${this.skills.includes(k)?'checked':''} ${!this.skills.includes(k)&&this.skills.length>=2?'disabled':''}> ${v}</label>`).join("")}</div></div>`:""}
       ${warn.length?`<h4>Worth a look</h4><ul class="ov-list ov-warn ov-warn-list">${warn.map(r=>row(r,"ov-warn")).join("")}</ul>`:""}
       <details class="ov-done"><summary>Matched automatically (${done.length})</summary><ul class="ov-list">${done.map(r=>row(r,"ov-ok")).join("")}</ul></details>
-      <div class="ov-actions"><button type="button" class="create" data-act="create" ${block.length||this.creating||this.busy?"disabled":""}><i class="fa-solid ${t?"fa-arrows-rotate":"fa-user-plus"}"></i> ${verb}</button><button type="button" data-goto-step="1">Review step by step</button></div>
+      <div class="ov-actions"><button type="button" class="create" data-act="create" ${block.length?'data-blocked="1"':""} ${block.length||this.creating||this.busy?"disabled":""}><i class="fa-solid ${t?"fa-arrows-rotate":"fa-user-plus"}"></i> ${verb}</button><button type="button" data-goto-step="1">Review step by step</button></div>
       ${block.length?`<p class="muted">Create unlocks when the choices above are made. Everything else can be fixed on the sheet afterwards.</p>`:""}
     </div>`;
   }
-  uploadView(){ return `<section><h2>Import Discord Character Export</h2><p>Upload the bot's <code>.json</code> export. Standard JSON and the server bot's Python-style dictionary format are both accepted. Choosing a new file starts a fresh import.</p><span class="upload-links"><button type="button" class="link-button" data-refresh-content title="Re-read compendiums after importing new content">Refresh content</button><button type="button" class="link-button" data-copy-diagnostics title="Copy a report to paste into Discord or a bug report">Copy diagnostics</button></span><label class="drop${this.data?" compact":""}"><i class="fa-solid fa-file-arrow-up"></i><strong>${this.data?esc(this.fileName):"Choose export file"}</strong><input data-file type="file" accept=".json,.txt,application/json,text/plain"></label>${this.data?`<div class="summary"><b>${esc(this.data.Name)}</b><span>Level ${Number(this.data.Level||0)}</span><span>${esc(this.data.Race||"Unknown species")}</span><span>${Object.entries(this.data.Class||{}).map(([k,v])=>`${esc(k)} ${v.Level}${v.Subclass?` (${esc(v.Subclass)})`:""}`).join(" / ")}</span></div>`:""}${this.data&&!this.busy&&this.coreDocs.length?this.overviewView():""}${this.sourceFilterView()}</section>`; }
+  uploadView(){ return `<section><h2>Import Discord Character Export</h2><p>Upload the bot's <code>.json</code> export. Standard JSON and the server bot's Python-style dictionary format are both accepted. Choosing a new file starts a fresh import.</p><span class="upload-links"><button type="button" class="link-button" data-refresh-content title="Re-read compendiums after importing new content">Refresh content</button><button type="button" class="link-button" data-copy-diagnostics title="Copy a report to paste into Discord or a bug report">Copy diagnostics</button></span><label class="drop${this.data?" compact":""}"><i class="fa-solid fa-file-arrow-up"></i><strong>${this.data?esc(this.fileName):"Choose the export file, or drop it here"}</strong><input data-file type="file" accept=".json,.txt,application/json,text/plain"></label>${this.data?`<div class="summary"><b>${esc(this.data.Name)}</b><span>Level ${Number(this.data.Level||0)}</span><span>${esc(this.data.Race||"Unknown species")}</span><span>${Object.entries(this.data.Class||{}).map(([k,v])=>`${esc(k)} ${Number(v.Level)}${v.Subclass?` (${esc(v.Subclass)})`:""}`).join(" / ")}</span></div>`:""}${featureChoicesMoved()?`<div class="warning">This importer was built for dnd5e 5.3 and 6.0. From dnd5e 6.1, Fighting Style, Weapon Mastery and similar choices sit on the feature itself and are not offered here yet. Make those choices on the sheet after importing.</div>`:""}${this.data&&!this.busy&&this.prepared?this.overviewView():""}${this.sourceFilterView()}</section>`; }
   coreView(){
     if(!this.data)return""; const base=baseStats(this.data), eff=effectiveStats(this.data); const avg=averageHp(this.data,this.classOrder.length?this.classOrder:undefined,null,this.hitDiceByClass());
     const speciesOptions=this.speciesCandidates(),selectedSpecies=this.selectedSpeciesEntry();
     const matched=this.coreDocs.filter(x=>x.kind==="class"||x.kind==="subclass").map(x=>`<li><b>${esc(x.name)}</b> → ${esc(x.doc?.name||"?")}${x.kind==="subclass"?` <small>(${esc(x.className)} subclass)</small>`:""}</li>`).join("");
     const missing=Object.entries(this.data.Class||{}).flatMap(([cn,c])=>[...(this.coreDocs.some(x=>x.kind==="class"&&x.name===cn)?[]:[{name:cn,type:"class"}]),...(c.Subclass&&!this.coreDocs.some(x=>x.kind==="subclass"&&x.name===c.Subclass)?[{name:c.Subclass,type:"subclass"}]:[])]);
     const missingText=missing.map(x=>`${x.name} — ${resolver.diagnostic(x.name,[x.type])}`);
-    return `<section><h2>Core Character</h2><div class="grid6">${ABILITIES.map(a=>`<div class="stat"><label>${a.toUpperCase()}</label><strong>${base[a]}</strong>${eff[a]!==base[a]?`<small>${eff[a]} with items</small>`:""}</div>`).join("")}</div><p class="muted">${this.featBonusNote()}Magic items that change a score apply their own effect in Foundry; the bot's bonus is only added when an item becomes a placeholder.</p>${speciesOptions.length?`<h3>Species</h3><p class="muted">Size suffixes such as (Medium) are used for the species size choice. If multiple 2024 versions or legacies are available, choose the intended one.</p><select data-species-choice>${speciesOptions.map(e=>`<option value="${esc(e.uuid)}" ${selectedSpecies?.uuid===e.uuid?'selected':''}>${esc(e.name)} — ${esc(e.plutonium?.source||e.source?.book||'2024')}</option>`).join("")}</select>`:""}${matched||missing.length?`<h3>Class Matches</h3><ul class="match-list">${matched}</ul>${missing.length?`<div class="warning">${missingText.map(esc).join("<br>")}</div>`:""}`:""}<h3>Hit Points</h3><p>Foundry calculates maximum HP from each class's hit die (maximum at level 1, average after), Constitution, and features such as Tough or Dwarven Toughness. Enter a number only if this character's HP must be a fixed total.</p><div class="form-row"><label>Estimated HP</label><input value="${avg}" disabled><label>Fixed HP (optional)</label><input data-hp type="number" min="1" autocomplete="off" placeholder="Calculated" value="${esc(this.hpOverride)}"></div>${Object.keys(this.data.Class||{}).length>1?this.classOrderView():""}<div class="notice">2024 rules plus enabled UA/custom sources. No Background document will be imported.</div></section>`;
+    return `<section><h2>Character</h2><div class="grid6">${ABILITIES.map(a=>`<div class="stat"><label>${a.toUpperCase()}</label><strong>${base[a]}</strong>${eff[a]!==base[a]?`<small>${eff[a]} with items</small>`:""}</div>`).join("")}</div><p class="muted">${this.featBonusNote()}Magic items that change a score apply their own effect in Foundry; the bot's bonus is only added when an item becomes a placeholder.</p>${speciesOptions.length?`<h3>Species</h3><p class="muted">Size suffixes such as (Medium) are used for the species size choice. If multiple 2024 versions or legacies are available, choose the intended one.</p><select data-species-choice>${speciesOptions.map(e=>`<option value="${esc(e.uuid)}" ${selectedSpecies?.uuid===e.uuid?'selected':''}>${esc(e.name)} — ${esc(e.plutonium?.source||e.source?.book||'2024')}</option>`).join("")}</select>`:""}${matched||missing.length?`<h3>Class Matches</h3><ul class="match-list">${matched}</ul>${missing.length?`<div class="warning">${missingText.map(esc).join("<br>")}</div>`:""}`:""}<h3>Hit Points</h3><p>Foundry calculates maximum HP from each class's hit die (maximum at level 1, average after), Constitution, and features such as Tough or Dwarven Toughness. Enter a number only if this character's HP must be a fixed total.</p><div class="form-row"><label>Estimated HP</label><input value="${avg}" disabled><label>Fixed HP (optional)</label><input data-hp type="number" min="1" autocomplete="off" placeholder="Calculated" value="${esc(this.hpOverride)}"></div>${Object.keys(this.data.Class||{}).length>1?this.classOrderView():""}<div class="notice">2024 rules plus enabled UA/custom sources. No Background document will be imported.</div></section>`;
   }
   featBonusNote(){
     const fb=this.data?.__featStatBonuses||[]; if(!fb.length) return "Base scores are imported as-is. ";
@@ -1534,10 +1617,9 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
     const origin=getOriginFeat(this.data); const originKey=norm(origin);
     const otherFeats=[]; const seen=new Set();
     for(const raw of (this.data.Feats||[])){ const f=canonicalFeatName(raw), k=norm(f); if(!f||k===originKey||seen.has(k))continue; seen.add(k); otherFeats.push(f); }
-    const resilientHandled=this.advChoiceDefs.some(d=>d.sourceKind==="feat"&&/resilient/i.test(d.sourceName)&&d.options.some(o=>String(o.value).startsWith("saves:")));
-    return `<section><h2>Skills & Features</h2>
+    return `<section><h2>Choices</h2>
       <div class="feature-source-group server-group"><h3>Server Origin Choices</h3><h4>Two Free Skill Proficiencies</h4><div class="skill-grid">${Object.entries(SKILLS).map(([k,v])=>`<label><input data-skill value="${k}" type="checkbox" ${this.skills.includes(k)?'checked':''} ${!this.skills.includes(k)&&this.skills.length>=2?'disabled':''}> ${v}</label>`).join("")}</div>${origin?`<h4>Free Origin Feat</h4><p class="muted">Read from the bot's Background field; no Background document is created.</p>${this.serverOriginSearchBlock(origin)}`:""}</div>
-      <div class="feature-source-group"><h3>Other Feats</h3>${otherFeats.length?otherFeats.map(f=>this.matchRow(`feat:${f}`,f,["feat"])).join(""):'<p class="muted">No additional feats in the bot export.</p>'}${uniqueFeatNames(this.data).some(f=>norm(f)==="resilient")&&!resilientHandled?`<div class="resilient-choice"><h4>Resilient — Saving Throw Proficiency</h4><p class="muted">The bot ability scores are already final, so the +1 ability score is not applied again.</p><select data-resilient-save><option value="">Choose ability…</option>${ABILITIES.map(a=>`<option value="${a}" ${this.resilientSave===a?'selected':''}>${a.toUpperCase()}</option>`).join("")}</select></div>`:""}</div>
+      <div class="feature-source-group"><h3>Other Feats</h3>${otherFeats.length?otherFeats.map(f=>this.matchRow(`feat:${f}`,f,["feat"])).join(""):'<p class="muted">No additional feats in the bot export.</p>'}${this.needsResilientSave()?`<div class="resilient-choice"><h4>Resilient — Saving Throw Proficiency</h4><p class="muted">The bot ability scores are already final, so the +1 ability score is not applied again.</p><select data-resilient-save><option value="">Choose ability…</option>${ABILITIES.map(a=>`<option value="${a}" ${this.resilientSave===a?'selected':''}>${a.toUpperCase()}</option>`).join("")}</select></div>`:""}</div>
       ${this.advChoiceDefs.length?`<p class="muted source-note">The choices below are grouped by the document that owns each Foundry Advancement. Feat choices appear once the feat is matched above.</p>${this.advancementGroupsView()}`:""}
       ${this.featurePlacementView()}
       <p class="muted">Ability scores from the bot are treated as final, so Ability Score Improvement advancements are not re-applied.</p></section>`;
@@ -1562,7 +1644,7 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
       return `<label data-spell-row="${esc(sp.name.toLowerCase())}" data-spell-level="${Number(sp.level||0)}"><input data-spell value="${esc(sp.uuid)}" type="checkbox" ${this.spells.has(sp.uuid)?'checked':''} ${granted?'disabled title="Granted automatically"':''}><span class="level">${sp.level===0?'C':sp.level}</span><span>${esc(sp.name)}${granted?' <small>(granted)</small>':''}</span><small>${esc(sp.source?.book||"")}</small>${choices.length>1?`<select data-spell-class="${esc(sp.uuid)}">${choices.map(c=>`<option ${c===assigned?'selected':''}>${esc(c)}</option>`).join("")}</select>`:`<span class="spell-class">${esc(assigned)}</span>`}</label>`;
     }).join("");
     const levels=[...new Set(display.map(s=>Number(s.level||0)))].sort((a,b)=>a-b);
-    return `<section><h2>Select Spells</h2>${profileBlock}<div class="notice">${fallback?`Class spell-list data was unavailable, so every spell up to the highest configured level is shown. Choose the casting class for each spell you select.`:`Spell access is filtered by each class's list and configured maximum spell level.`}</div><div class="spell-toolbar"><input data-spell-search class="search" placeholder="Filter spells..."><select data-spell-level-filter><option value="all">All levels</option>${levels.map(l=>`<option value="${l}" ${String(this.spellLevelFilter)===String(l)?'selected':''}>${l===0?'Cantrips':`Level ${l}`}</option>`).join("")}</select></div><div class="spell-actions"><button type="button" data-act="clear-spells">Clear</button><span class="spell-counts ${this.spellLimitProblems().length?'over':''}" data-spell-counts>${this.spellCountsText()}</span></div><div class="spell-list">${rows}</div>${this.grantedSpells.size?`<div class="granted-spells"><h3>Granted Subclass Spells</h3><p class="muted">Imported automatically as always prepared; not counted against your choices.</p>${[...this.grantedSpells.values()].map(g=>`<div class="granted-spell"><b>${esc(g.name)}</b><span>${esc(g.ownerSubclass)} — ${esc(g.feature)}</span></div>`).join("")}</div>`:""}<p class="muted">Spells granted by species, subclass, and feat advancements are added with their own settings and are not listed here.</p></section>`;
+    return `<section><h2>Spells</h2>${profileBlock}<div class="notice">${fallback?`Class spell-list data was unavailable, so every spell up to the highest configured level is shown. Choose the casting class for each spell you select.`:`Spell access is filtered by each class's list and configured maximum spell level.`}</div><div class="spell-toolbar"><input data-spell-search class="search" placeholder="Filter spells..."><select data-spell-level-filter><option value="all">All levels</option>${levels.map(l=>`<option value="${l}" ${String(this.spellLevelFilter)===String(l)?'selected':''}>${l===0?'Cantrips':`Level ${l}`}</option>`).join("")}</select></div><div class="spell-actions"><button type="button" data-act="clear-spells">Clear</button><span class="spell-counts ${this.spellLimitProblems().length?'over':''}" data-spell-counts>${this.spellCountsText()}</span></div><div class="spell-list">${rows}</div>${this.grantedSpells.size?`<div class="granted-spells"><h3>Granted Subclass Spells</h3><p class="muted">Imported automatically as always prepared; not counted against your choices.</p>${[...this.grantedSpells.values()].map(g=>`<div class="granted-spell"><b>${esc(g.name)}</b><span>${esc(g.ownerSubclass)} — ${esc(g.feature)}</span></div>`).join("")}</div>`:""}<p class="muted">Spells granted by species, subclass, and feat advancements are added with their own settings and are not listed here.</p></section>`;
   }
   /** Cantrip and prepared-spell limits for a class profile: the class's own scale values first, then the 2024 PHB table. */
   spellLimitsFor(cn){
@@ -1576,7 +1658,7 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
     return {cantrips,prepared,source:(fromDoc.cantrips!==undefined||fromDoc.prepared!==undefined)?"class data":"2024 PHB"};
   }
   spellTally(){
-    const per=new Map(); for(const u of this.spells){ const e=resolver.entries.find(x=>x.uuid===u); const cn=this.spellClassAssignments.get(u)||"Unassigned"; const r=per.get(cn)||{c:0,l:0}; if(Number(e?.level||0)===0)r.c++; else r.l++; per.set(cn,r); }
+    const per=new Map(); for(const u of this.spells){ const e=resolver.get(u); const cn=this.spellClassAssignments.get(u)||"Unassigned"; const r=per.get(cn)||{c:0,l:0}; if(Number(e?.level||0)===0)r.c++; else r.l++; per.set(cn,r); }
     for(const [cn,p] of this.casterProfiles) if(norm(p.progression)!=="none"&&Number(p.casterLevel)>0&&!per.has(cn)) per.set(cn,{c:0,l:0});
     return per;
   }
@@ -1599,7 +1681,7 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
   itemEntryFor(u){
     if(!u||u==="__placeholder__"||String(u).startsWith("__scroll__")) return null;
     if(String(u).startsWith("__rawitem__")){ const it=plutoniumBridge.rawItemById.get(u); if(!it) return null; const e=plutoniumBridge.rawItemEntry(it); const t=code5et(it.type); return {...e,itemTypeValue:{LA:"light",MA:"medium",HA:"heavy",S:"shield"}[t]||""}; }
-    return resolver.entries.find(r=>r.uuid===u)||resolver.excludedEntries.find(r=>r.uuid===u)||null;
+    return resolver.getAny(u)||null;
   }
   /** Armor, shields and weapons start equipped; one body armor and one shield at most. */
   defaultEquipment(owned){
@@ -1617,12 +1699,12 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
     const defaults=this.defaultEquipment(owned);
     const rows=html.sort((a,b)=>(b.low-a.low)||(a.i-b.i)).map(({i,x,id,sel,low})=>{ const st=this.equipState(i,x,defaults); return `<div class="equip ${low?'needs-check':''}"><div><b>${esc(x.name)}</b><small>${x.category}${low?' · check match':''}${x.qty===0?' · used up':''}</small></div>${sel}<label>Qty <input data-eq-qty="${id}" type="number" min="0" value="${st.qty}"></label><label><input data-eq-equipped="${id}" type="checkbox" ${st.equipped?'checked':''}> Equipped</label>${x.attunement||x.attuned?`<label><input data-eq-attuned="${id}" type="checkbox" ${st.attuned?'checked':''}> Attuned</label>`:'<span></span>'}</div>`; }).join("");
     const lows=html.filter(r=>r.low).length;
-    return `<section><h2>Equipment & Inventory</h2><p>Confirm each match, quantity, equipped state, and attunement. Armor, shields and weapons start equipped.</p>${lows?`<div class="warning">${lows} item(s) matched with low confidence and are listed first. Check that each is the right item (for example a +1 weapon rather than the mundane one).</div>`:""}<div class="equip-list">${rows}</div></section>`;
+    return `<section><h2>Equipment</h2><p>Confirm each match, quantity, equipped state, and attunement. Armor, shields and weapons start equipped.</p>${lows?`<div class="warning">${lows} item(s) matched with low confidence and are listed first. Check that each is the right item (for example a +1 weapon rather than the mundane one).</div>`:""}<div class="equip-list">${rows}</div></section>`;
   }
   reviewView(){
     if(!this.data)return"";
     const hp=Number(this.hpOverride)||averageHp(this.data,this.classOrder.length?this.classOrder:undefined,null,this.hitDiceByClass()), base=baseStats(this.data);
-    const owned=flattenOwned(this.data); const eqName=k=>owned[Number(k.slice(3))]?.name||k;
+    const owned=flattenOwned(this.data); const eqName=k=>k.startsWith("eq:")?(owned[Number(k.slice(3))]?.name||k):k.replace(/^feat:/,"");
     const placeholders=[...this.matches.entries()].filter(([,v])=>v==="__placeholder__").map(([k])=>k.startsWith("eq:")?eqName(k):k.replace(/^feat:/,""));
     const lows=[...this.lowConfidence].filter(k=>this.matches.get(k)!=="__placeholder__").map(eqName);
     const origin=getOriginFeat(this.data), originKey=norm(origin); const originMatch=this.matches.get(`feat:${origin}`); const originEntry=originMatch&&originMatch!=="__placeholder__"?this.featEntryById(originMatch):null;
@@ -1632,14 +1714,14 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
     const groupSummary=["race","class","subclass","feat"].map(kind=>{ const defs=this.advChoiceDefs.filter(d=>d.sourceKind===kind); if(!defs.length)return""; return `<div class="review-section"><h4>${this.sourceGroupLabel(kind)}</h4>${defs.map(d=>`<p><b>${esc(d.sourceName)} — ${esc(d.title)}${Number(d.level||0)>0?` (Level ${d.level})`:""}:</b> ${this.choiceSelectionLabels(d).map(esc).join(", ")||"No choice"}</p>`).join("")}</div>`; }).join("");
     const users=(game.users?.contents||[...(game.users||[])]).filter(u=>!u.isGM);
     const langs=[...this.finalTraits.languages].map(languageLabel).join(", ");
-    return `<section><h2>Review</h2><div class="review-card"><h3>${esc(this.data.Name)}</h3><p><b>Species:</b> ${esc(this.data.Race)}</p><p><b>Classes:</b> ${Object.entries(this.data.Class||{}).map(([k,v])=>`${esc(k)} ${v.Level}${v.Subclass?` / ${esc(v.Subclass)}`:""}`).join(" • ")}</p><p><b>HP ${this.hpOverride?`${hp} (fixed)`:`about ${hp} (calculated by Foundry)`}</b> • ${ABILITIES.map(a=>`${a.toUpperCase()} ${base[a]}`).join(" • ")}</p></div>
+    return `<section><h2>Review</h2><div class="review-card"><h3>${esc(this.data.Name)}</h3><p><b>Species:</b> ${esc(this.data.Race)}</p><p><b>Classes:</b> ${Object.entries(this.data.Class||{}).map(([k,v])=>`${esc(k)} ${Number(v.Level)}${v.Subclass?` / ${esc(v.Subclass)}`:""}`).join(" • ")}</p><p><b>HP ${this.hpOverride?`${hp} (fixed)`:`about ${hp} (calculated by Foundry)`}</b> • ${ABILITIES.map(a=>`${a.toUpperCase()} ${base[a]}`).join(" • ")}</p></div>
       <div class="review-section"><h4>Server Origin Choices</h4><p><b>Free skills:</b> ${this.skills.map(s=>SKILLS[s]).join(", ")||"None selected"}</p><p><b>Free Origin feat:</b> ${origin?(originEntry?`${esc(origin)} → ${esc(originEntry.name)} <small>${esc(originEntry.plutonium?.source||originEntry.source?.book||"")}</small>`:`${esc(origin)} <em>(placeholder)</em>`):"None"}</p></div>
       ${groupSummary}<div class="review-section"><h4>Other Feats</h4><p>${otherFeats.map(featLabel).join(", ")||"None"}</p></div>
       <div class="review-section"><h4>Spellcasting</h4>${[...this.casterProfiles.entries()].map(([cn,p])=>`<p><b>${esc(cn)}:</b> level ${Number(p.casterLevel||0)}, ${esc(p.progression)} progression${p.via?` via ${esc(p.via)}`:""}, ${esc(String(p.ability||"").toUpperCase())}, max spell level ${p.maxOverride!==""?Number(p.maxOverride):maxSpellLevelForProgression(p.progression,p.casterLevel)}</p>`).join("")}<p>${esc(this.spellCountsText())}; ${this.grantedSpells.size} granted subclass spell(s).</p>${this.spellLimitProblems().length?`<div class="warning"><b>Over the spell limits:</b> ${this.spellLimitProblems().map(esc).join("; ")}.</div>`:""}</div>
-      <div class="review-section"><h4>Final Traits</h4><p><b>Resistances:</b> ${[...this.finalTraits.dr].join(", ")||"None"}</p><p><b>Damage Immunities:</b> ${[...this.finalTraits.di].join(", ")||"None"}</p><p><b>Condition Immunities:</b> ${[...this.finalTraits.ci].join(", ")||"None"}</p><p><b>Languages:</b> ${esc(langs)||"None"}</p><p><b>Tools:</b> ${[...this.finalTraits.tools].map(toolLabel).join(", ")||"None"}</p></div>
+      <div class="review-section"><h4>Final Traits</h4><p><b>Resistances:</b> ${esc([...this.finalTraits.dr].join(", "))||"None"}</p><p><b>Damage Immunities:</b> ${esc([...this.finalTraits.di].join(", "))||"None"}</p><p><b>Condition Immunities:</b> ${esc([...this.finalTraits.ci].join(", "))||"None"}</p><p><b>Languages:</b> ${esc(langs)||"None"}</p><p><b>Tools:</b> ${esc([...this.finalTraits.tools].map(toolLabel).join(", "))||"None"}</p></div>
       ${game.user.isGM?`<div class="review-section"><h4>Owner</h4><select data-owner><option value="">GM only</option>${users.map(u=>`<option value="${esc(u.id)}" ${this.ownerId===u.id?'selected':''}>${esc(u.name)}</option>`).join("")}</select><p class="muted">The selected player gets Owner permission on the new actor.</p></div>`:""}
       ${placeholders.length?`<div class="warning"><b>${placeholders.length} placeholder(s)</b> will be created: ${placeholders.map(esc).join(", ")}.</div>`:""}
-      ${lows.length?`<div class="warning"><b>Low-confidence matches:</b> ${lows.map(esc).join(", ")}. Go back to Equipment to confirm them.</div>`:""}
+      ${lows.length?`<div class="warning"><b>Low-confidence matches:</b> ${lows.map(esc).join(", ")}. Go back and confirm them.</div>`:""}
       ${incomplete.length?`<div class="warning"><b>Choices to finish by hand after import:</b> ${incomplete.map(d=>`${esc(d.sourceName)} — ${esc(d.title)}`).join("; ")}.</div>`:""}
       <div class="notice">Species, class, subclass, feat and server-origin choices are shown separately so source-mapping mistakes are visible before the actor is created.</div></section>`;
   }
@@ -1664,7 +1746,7 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
   rememberedMatch(name,types=[]){
     const m=itemMemory.get(name); const u=m?.uuid; if(!u) return null;
     if(String(u).startsWith("__rawitem__")) return plutoniumBridge.rawItemById?.has(u)?{uuid:u,label:m.label}:null;
-    const e=resolver.entries.find(x=>x.uuid===u)||resolver.excludedEntries.find(x=>x.uuid===u);
+    const e=resolver.getAny(u);
     return e&&(!types.length||types.includes(e.type))?{uuid:u,label:m.label||e.name,entry:e}:null;
   }
   matchSelect(id,name,types,alts=[]){
@@ -1678,7 +1760,7 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
     if(this.skills.length!==2) return "Select exactly two free skill proficiencies.";
     const origin=getOriginFeat(this.data); if(origin&&!this.matches.get(`feat:${origin}`)) return `Choose the database feat for the Origin feat “${origin}”, or use a placeholder.`;
     for(const d of this.advChoiceDefs){ const need=this.requiredCount(d); if((this.advChoices.get(d.id)||[]).length!==need) return `Complete choice: ${d.sourceName} — ${d.title} (choose ${need}).`; }
-    if(uniqueFeatNames(this.data).some(f=>norm(f)==="resilient")&&!this.resilientSave&&this.element?.querySelector("[data-resilient-save]")) return "Choose the saving throw proficiency granted by Resilient.";
+    if(this.needsResilientSave()&&!this.resilientSave) return "Choose the saving throw proficiency granted by Resilient.";
     // Skill proficiencies: no duplicates; expertise only on proficient skills.
     const fixed=new Set(), picked=[];
     for(const src of [...this.coreDocs,...this.featDocs]) for(const adv of advancementEntries(src.doc,src.level,src.isPrimary)) if(adv.type==="Trait"&&["default","upgrade",undefined].includes(adv.configuration?.mode)) for(const g of (adv.configuration?.grants||[])) if(String(g).startsWith("skills:")) fixed.add(String(g).split(":").pop());
@@ -1689,8 +1771,19 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
     return "";
   }
   async bind(root){
-    root.querySelector("[data-file]")?.addEventListener("change",async e=>{ const f=e.target.files[0]; if(!f)return; try{ await this.loadExport(await f.text(),f.name); }
-      catch(err){ console.error(err); logImportError("Reading export",err); this.setBusy(""); ui.notifications.error(`Could not read export: ${err.message}`); } });
+    const readFile=async f=>{ if(!f||this._loadingExport) return; this._loadingExport=true;
+      try{ await this.loadExport(await f.text(),f.name); }
+      catch(err){ console.error(err); logImportError("Reading export",err); this.setBusy(""); ui.notifications.error(`Could not read export: ${err.message}`); }
+      finally{ this._loadingExport=false; } };
+    root.querySelector("[data-file]")?.addEventListener("change",e=>readFile(e.target.files[0]));
+    const drop=root.querySelector(".drop");
+    if(drop){
+      for(const type of ["dragenter","dragover"]) drop.addEventListener(type,e=>{ e.preventDefault(); e.stopPropagation(); drop.classList.add("dragging"); });
+      drop.addEventListener("dragleave",()=>drop.classList.remove("dragging"));
+      drop.addEventListener("drop",e=>{ e.preventDefault(); e.stopPropagation(); drop.classList.remove("dragging"); readFile(e.dataTransfer?.files?.[0]); });
+    }
+    // Remember only what the user chose: the box is open before a file is loaded and folds away after, unless they say otherwise.
+    root.querySelector(".source-filter > summary")?.addEventListener("click",e=>{ this.sourcesOpen=!e.currentTarget.parentElement.open; });
     root.querySelector("[data-copy-diagnostics]")?.addEventListener("click",()=>copyDiagnostics(this));
     root.querySelector("[data-target-actor]")?.addEventListener("change",async e=>{ if(this.busy) return; const id=e.target.value;
       try{ const t=id?game.actors?.get(id):null;
@@ -1699,7 +1792,7 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
       catch(err){ console.error(err); logImportError("Switching import target",err); this.setBusy(""); ui.notifications.error(err.message); } });
     root.querySelector("[data-backup]")?.addEventListener("change",e=>{ this.backup=e.target.checked; });
     root.querySelector("[data-source-search]")?.addEventListener("input",e=>{ this.sourceSearch=e.target.value||""; const q=norm(this.sourceSearch); root.querySelectorAll("[data-source-row]").forEach(r=>r.style.display=!q||r.dataset.sourceRow.includes(q)?"":"none"); });
-    const sourcesChanged=async()=>{ resolver.setEnabledPlutoniumSources(this.enabledSources); const s=root.querySelector(".source-filter summary small"); if(s) s.textContent=`${this.enabledSources.size}/${root.querySelectorAll("[data-source-code]").length} enabled`; if(this.data) await this.prepareCharacterMetadata(); };
+    const sourcesChanged=async()=>{ resolver.setEnabledPlutoniumSources(this.enabledSources); const s=root.querySelector(".source-filter summary small"); if(s) s.textContent=`${this.enabledSources.size}/${root.querySelectorAll("[data-source-code]").length} enabled`; if(this.data){ await this.prepareCharacterMetadata(); await this.rerender(); } };
     root.querySelectorAll("[data-source-code]").forEach(c=>c.addEventListener("change",async e=>{ if(this.enabledSources===null)this.enabledSources=new Set([...resolver.plutoniumSources(),...plutoniumBridge.rawFeatSources()].map(x=>x.code)); e.target.checked?this.enabledSources.add(e.target.value):this.enabledSources.delete(e.target.value); await sourcesChanged(); }));
     root.querySelector("[data-source-all]")?.addEventListener("click",async()=>{this.enabledSources=new Set([...resolver.plutoniumSources(),...plutoniumBridge.rawFeatSources()].map(x=>x.code));root.querySelectorAll("[data-source-code]").forEach(x=>x.checked=true);await sourcesChanged();});
     root.querySelector("[data-source-none]")?.addEventListener("click",async()=>{this.enabledSources=new Set();root.querySelectorAll("[data-source-code]").forEach(x=>x.checked=false);await sourcesChanged();});
@@ -1707,7 +1800,7 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
       const a=b.dataset.act; if(this.busy) return;
       if(a==="back"){this.step--;await this.render();}
       else if(a==="next"){
-        if(this.step===1) await this.prepareCharacterMetadata();
+        if(this.step===1&&!this.prepared) await this.prepareCharacterMetadata();
         if(this.step===3){
           // 2024 limits are a maximum. Warn once per selection; a second Next continues (homebrew, feats, DM rulings).
           const over=this.spellLimitProblems();
@@ -1722,11 +1815,14 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
       else if(a==="create") await this.createActor(b);
       else if(a==="overview"){ this.step=0; await this.render(); }
     }));
-    root.querySelectorAll("[data-goto-step]").forEach(b=>b.addEventListener("click",async()=>{ if(this.busy) return; const to=Number(b.dataset.gotoStep);
-      if(to>=2&&this.step<2&&!this.advChoiceDefs.length) await this.prepareCharacterMetadata();
-      if(to===5){ this.setBusy("Detecting traits…"); try{ await this.refreshDetectedTraits(); } finally { this.setBusy(""); } }
-      this.step=to; await this.render(); }));
-    root.querySelector("[data-refresh-content]")?.addEventListener("click",async()=>{ if(this.busy) return; this.setBusy("Re-reading compendiums…"); try{ await resolver.load(true); await plutoniumBridge.buildFeatIndex(true); await plutoniumBridge.buildItemIndex(true); await plutoniumBridge.buildSpellClassMap(true); if(this.data) await this.prepareCharacterMetadata(); } finally { this.setBusy(""); } await this.render(); });
+    root.querySelectorAll("[data-goto-step]").forEach(b=>{
+      b.addEventListener("click",async()=>{ if(this.busy||!this.data) return; const to=Number(b.dataset.gotoStep);
+        if(to>=1&&!this.prepared) await this.prepareCharacterMetadata();
+        if(to>=5){ this.setBusy("Detecting traits…"); try{ await this.refreshDetectedTraits(); } finally { this.setBusy(""); } }
+        this.step=to; await this.render(); });
+      if(b.tagName!=="BUTTON") b.addEventListener("keydown",e=>{ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); b.click(); } });
+    });
+    root.querySelector("[data-refresh-content]")?.addEventListener("click",async()=>{ if(this.busy) return; this.setBusy("Re-reading compendiums…"); try{ this._docCache=new Map(); await resolver.load(true); await plutoniumBridge.buildFeatIndex(true); await plutoniumBridge.buildItemIndex(true); await plutoniumBridge.buildSpellClassMap(true); if(this.data) await this.prepareCharacterMetadata(); } finally { this.setBusy(""); } await this.render(); });
     const hpInput=root.querySelector("[data-hp]"); if(hpInput){ if(this.hpOverride==="")hpInput.value=""; hpInput.addEventListener("input",e=>this.hpOverride=e.target.value); }
     root.querySelector("[data-feat-bonuses-included]")?.addEventListener("change",async e=>{ Object.defineProperty(this.data,"__featBonusesInStats",{value:e.target.checked,enumerable:false,writable:true,configurable:true}); await this.rerender(); });
     root.querySelector("[data-start-class]")?.addEventListener("change",async e=>{ this.classOrder=this.orderStartingWith(e.target.value); await this.prepareCharacterMetadata(); await this.rerender(); });
@@ -1749,7 +1845,7 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
       if(!e.target.checked)this.skills=this.skills.filter(x=>x!==v);
       // Update disabled states in place; re-rendering resets scroll position in Foundry v14.
       root.querySelectorAll("[data-skill]").forEach(x=>x.disabled=!x.checked&&this.skills.length>=2);
-      if(this.step===0&&this.skills.length===2) this.render();  // refresh the overview once both are picked
+      if(this.step===0){ this._ovSkills=true; this.rerender(); }  // keep the overview's list and Create button in step
     }));
     const featChanged=async()=>{ this.setBusy("Loading feat choices…"); try{ await this.rebuildChoiceDefs(); await this.rebuildFeaturePlacementDefs(); } finally { this.setBusy(""); } await this.rerender(); };
     root.querySelectorAll("[data-match]").forEach(s=>s.addEventListener("change",async e=>{ const id=e.target.dataset.match; this.matches.set(id,e.target.value); (this.confirmed??=new Set()).add(id); this.lowConfidence.delete(id); e.target.closest(".needs-check")?.classList.remove("needs-check"); if(id.startsWith("feat:")) await featChanged(); else if(id.startsWith("eq:")){ const i=Number(id.slice(3)); const st=this.equipment.get(id)||{}; if(!("equipped" in st)){ const d=this.defaultEquipment(flattenOwned(this.data)).get(id); this.updateEq(id,{equipped:d?.equipped??false}); const box=root.querySelector(`[data-eq-equipped="${CSS.escape(id)}"]`); if(box) box.checked=!!this.equipment.get(id).equipped; } } }));
@@ -1792,7 +1888,19 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
     root.querySelectorAll("[data-eq-attuned]").forEach(i=>i.addEventListener("change",e=>this.updateEq(e.target.dataset.eqAttuned,{attuned:e.target.checked})));
   }
   updateEq(id,patch){this.equipment.set(id,{...(this.equipment.get(id)||{}),...patch});}
-  async docData(uuid){ if(!uuid||uuid==="__placeholder__")return null; if(String(uuid).startsWith("__rawfeat__"))return plutoniumBridge.rawFeatToItemData(uuid); if(String(uuid).startsWith("__rawitem__"))return plutoniumBridge.rawItemToItemData(uuid); try{const d=await fromUuid(uuid); return d?.toObject?.()||null;}catch(_){return null;} }
+  /** Item data for a UUID (or a raw 5etools feat/item id). Read once per import; every caller gets its own copy. */
+  async docData(uuid){
+    if(!uuid||uuid==="__placeholder__") return null;
+    const cache=(this._docCache??=new Map());
+    if(!cache.has(uuid)){
+      let d=null;
+      if(String(uuid).startsWith("__rawfeat__")) d=await plutoniumBridge.rawFeatToItemData(uuid);
+      else if(String(uuid).startsWith("__rawitem__")) d=await plutoniumBridge.rawItemToItemData(uuid);
+      else { try{ d=(await fromUuid(uuid))?.toObject?.()||null; }catch(_){ d=null; } }
+      cache.set(uuid,d||null);
+    }
+    const hit=cache.get(uuid); return hit?deepClone(hit):null;
+  }
   async nativeScrollData(value,qty=1){
     if(!String(value||"").startsWith("__scroll__:")) return null;
     const uuid=String(value).slice("__scroll__:".length); const spell=await getDoc(uuid); if(!spell)return null;
@@ -1800,7 +1908,7 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
     for(const cls of candidates){
       for(const fn of ["createScrollFromSpell","createScroll"]){
         if(typeof cls?.[fn]!=="function")continue;
-        try{ const out=await cls[fn](spell,{level:Number(spell.system?.level||0),prompt:false,create:false}); const d=out?.toObject?.()||out; if(d&&typeof d==="object"){foundry.utils.setProperty(d,"system.quantity",qty||1);return d;} }catch(e){console.warn(`${MODULE_ID} native scroll via ${fn} failed`,e);}
+        try{ const level=Number(spell.system?.level||0); const out=fn==="createScrollFromSpell"?await cls[fn](spell,{},{dialog:false,level}):await cls[fn](spell,{level,prompt:false,create:false}); const d=out?.toObject?.()||out; if(d&&typeof d==="object"){foundry.utils.setProperty(d,"system.quantity",qty||1);return d;} }catch(e){console.warn(`${MODULE_ID} native scroll via ${fn} failed`,e);}
       }
     }
     const generic=resolver.best("Spell Scroll",["consumable"]); let d=generic?await this.docData(generic.uuid):null;
@@ -1835,14 +1943,14 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
     return this.docData(uuid);
   }
   placeholder(name,type="loot",qty=1,raw=null){
-    const sys={quantity:qty,description:{value:`<p>Placeholder created by D&D Friends Character Importer. Original export name: <b>${esc(name)}</b>.</p>`},source:{custom:"D&D Friends Character Importer",rules:"2024"}};
+    const sys={quantity:qty,description:{value:`<p>Placeholder created by D&D Friends Character Importer. Original export name: <b>${esc(name)}</b>.</p>`},source:{custom:PLACEHOLDER_SOURCE,rules:"2024"}};
     // Keep what the export knows: rarity and attunement (magic item placeholders become equipment so attunement works).
     if(raw&&typeof raw==="object"){ const r=rarityKey(raw.Rarity); if(r) sys.rarity=r; if(raw.Attunement){ sys.attunement="required"; sys.attuned=raw.Attuned===true; }
       if(type==="equipment") sys.type={value:equipmentMiscType("wondrous")}; }
-    return {name,type,img:"icons/svg/item-bag.svg",system:sys};
+    return {name,type,img:"icons/svg/item-bag.svg",system:sys,flags:{[MODULE_ID]:{placeholder:true}}};
   }
   magicInitiateVariantUuid(baseUuid){
-    const base=resolver.entries.find(e=>e.uuid===baseUuid); if(originChoiceCanonicalName(base?.name||"")!=="Magic Initiate") return baseUuid;
+    const base=resolver.get(baseUuid); if(originChoiceCanonicalName(base?.name||"")!=="Magic Initiate") return baseUuid;
     const list=norm(this.magicInitiateList||"wizard");
     const matches=resolver.entries.filter(e=>resolver.allowed(e)).filter(e=>e.type==="feat" && /^magic\s+initiate/i.test(String(e.name||"")) && norm(e.name).includes(list)).sort(preferredOriginChoice);
     return matches[0]?.uuid||baseUuid;
@@ -1880,9 +1988,9 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
     for(const d of this.advChoiceDefs) if(d.type==="trait"&&(this.advChoices.get(d.id)||[]).length<d.count) unresolved.push(`${d.sourceName} — ${d.title}: ${d.count-(this.advChoices.get(d.id)||[]).length} choice(s) left (not enough options were found)`);
     return {embeds,updates,warnings,unresolved};
   }
-  /** Populate each class's HitPoints advancement so Foundry derives HP (and adds Tough, CON changes, level-ups). */
+  /** A copy of the actor as it is now, marked so it is never offered as an update target or used for matching. */
   async backupActor(actor){
-    const data=actor.toObject(); delete data._id; data.name=`${actor.name} (backup ${new Date().toLocaleDateString()})`;
+    const now=new Date(); const data=actor.toObject(); delete data._id; data.name=`${actor.name} (backup ${now.toLocaleDateString()} ${now.toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"})})`;
     data.flags=data.flags||{}; data.flags[MODULE_ID]={...(data.flags[MODULE_ID]||{}),backupOf:actor.id}; delete data.flags[MODULE_ID].choices;
     return Actor.implementation.create(data);
   }
@@ -1927,6 +2035,7 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
     if(foundry.utils.getProperty(src,"system.details.originalClass")) delete updates["system.details.originalClass"];
     return updates;
   }
+  /** Populate each class's HitPoints advancement so Foundry derives HP (and adds Tough, CON changes, level-ups). */
   applyHitPointAdvancement(d,levels,isStartingClass){
     for(const adv of advancementList(d)){ if(adv?.type!=="HitPoints") continue; const value={}; for(let l=1;l<=levels;l++) value[String(l)]=(l===1&&isStartingClass)?"max":"avg"; adv.value=value; }
   }
@@ -1956,10 +2065,10 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
         const up={"system.currency.gp":Number(this.data.GP||0)}; for(const a of ABILITIES) up[`system.abilities.${a}.value`]=stats[a];
         if(fixedHp) up["system.attributes.hp.max"]=fixedHp;
         await actor.unsetFlag?.(MODULE_ID,"rawExport");
-        up[`flags.${MODULE_ID}.sourceFile`]=this.fileName; up[`flags.${MODULE_ID}.rawExport`]=this.data; up[`flags.${MODULE_ID}.classOrder`]=this.classOrder; up[`flags.${MODULE_ID}.history`]=history(histEntry);
+        up[`flags.${MODULE_ID}.sourceFile`]=this.fileName; up[`flags.${MODULE_ID}.exportName`]=String(this.data.Name||""); up[`flags.${MODULE_ID}.exportText`]=this.sourceText; up[`flags.${MODULE_ID}.classOrder`]=this.classOrder; up[`flags.${MODULE_ID}.history`]=history(histEntry);
         await actor.update(up);
       } else
-      actor=await Actor.implementation.create({name:this.data.Name,type:"character",ownership,system:{abilities:Object.fromEntries(ABILITIES.map(a=>[a,{value:stats[a]}])),currency:{gp:Number(this.data.GP||0)},attributes:{hp:{value:fixedHp||1,max:fixedHp||null,temp:0,tempmax:0}},details:{alignment:"",background:null}},flags:{[MODULE_ID]:{sourceFile:this.fileName,rawExport:this.data,classOrder:this.classOrder,history:history(histEntry)}}});
+      actor=await Actor.implementation.create({name:this.data.Name,type:"character",ownership,system:{abilities:Object.fromEntries(ABILITIES.map(a=>[a,{value:stats[a]}])),currency:{gp:Number(this.data.GP||0)},attributes:{hp:{value:fixedHp||1,max:fixedHp||null,temp:0,tempmax:0}},details:{alignment:"",background:null}},flags:{[MODULE_ID]:{sourceFile:this.fileName,exportName:String(this.data.Name||""),exportText:this.sourceText,classOrder:this.classOrder,history:history(histEntry)}}});
       const embeds=[]; const warnings=[];
       const startClass=norm(this.classOrder[0]||Object.keys(this.data.Class||{})[0]||"");
       // Species, classes and subclasses: reuse the documents matched on the Core step.
@@ -2004,12 +2113,24 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
       this.setBusy(`Adding ${toCreate.length} items…`);
       const created=toCreate.length?await Item.implementation.createDocuments(toCreate,{parent:actor}):[];
       // Display-only feature placement against the local species/class/subclass documents.
-      const parents={species:actor.items.find(i=>i.type==="race"),class:actor.items.find(i=>i.type==="class"&&norm(i.name)===startClass),subclass:actor.items.find(i=>i.type==="subclass")};
+      const classItems=actor.items.filter(i=>i.type==="class"), subItems=actor.items.filter(i=>i.type==="subclass"), speciesItem=actor.items.find(i=>i.type==="race")||null;
+      const sameItem=(list,doc)=>{ const ident=doc?.system?.identifier; return (ident&&list.find(i=>i.system?.identifier===ident))||list.find(i=>norm(i.name)===norm(doc?.name||""))||null; };
+      // `owner` is "class:<name>" or "subclass:<name>" as written by collectNativeAdvancementData. A multiclass
+      // character's features are grouped under their own class, not under the starting class.
+      const parentFor=(place,owner="")=>{
+        if(place==="species") return speciesItem;
+        const cut=String(owner).indexOf(":"); const kind=cut>0?owner.slice(0,cut):"", oname=cut>0?norm(owner.slice(cut+1)):"";
+        const src=["class","subclass"].includes(kind)?this.coreDocs.find(x=>x.kind===kind&&norm(x.name)===oname):null;
+        const className=norm(kind==="class"?(src?.name||""):(src?.className||""));
+        if(place==="class"){ const cdoc=className?this.coreDocs.find(x=>x.kind==="class"&&norm(x.name)===className)?.doc:null; return (cdoc&&sameItem(classItems,cdoc))||classItems.find(i=>norm(i.name)===startClass)||classItems[0]||null; }
+        const sdoc=kind==="subclass"?src?.doc:(className?this.coreDocs.find(x=>x.kind==="subclass"&&norm(x.className)===className)?.doc:null);
+        return (sdoc&&sameItem(subItems,sdoc))||subItems[0]||null;
+      };
       const firstGrantId=doc=>{const a=advancementEntries(doc,99,true).find(x=>x.type==="ItemGrant");return a?._id||"cbiPlacement";}; const placementUpdates=[];
       for(const item of created){const meta=item.flags?.[MODULE_ID];if(!meta?.placementKey)continue;const place=this.featurePlacements.get(meta.placementKey)||meta.placementGuess||"other";let typeValue=item.system?.type?.value||"feat",origin=null;
-        if(place==="species"){if(typeValue!=="feat")typeValue="race";const p=parents.species;if(p)origin=`${p.id}.${firstGrantId(p)}`;}
-        else if(place==="class"){if(typeValue!=="feat")typeValue="class";const p=parents.class;if(p)origin=`${p.id}.${firstGrantId(p)}`;}
-        else if(place==="subclass"){if(typeValue!=="feat")typeValue="class";const p=parents.subclass;if(p)origin=`${p.id}.${firstGrantId(p)}`;}
+        if(place==="species"){if(typeValue!=="feat")typeValue="race";const p=parentFor(place,meta.owner);if(p)origin=`${p.id}.${firstGrantId(p)}`;}
+        else if(place==="class"){if(typeValue!=="feat")typeValue="class";const p=parentFor(place,meta.owner);if(p)origin=`${p.id}.${firstGrantId(p)}`;}
+        else if(place==="subclass"){if(typeValue!=="feat")typeValue="class";const p=parentFor(place,meta.owner);if(p)origin=`${p.id}.${firstGrantId(p)}`;}
         else if(place==="background"){typeValue="background";origin=null;}
         else {if(["race","class","background"].includes(typeValue))typeValue="feat";origin=null;}
         placementUpdates.push({_id:item.id,"system.type.value":typeValue,"flags.dnd5e.advancementOrigin":origin});
@@ -2045,7 +2166,7 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
       const did=updating?"Updated":"Created";
       ui.notifications[followUp.length?"warn":"info"](followUp.length?`${did} ${actor.name}. ${followUp.length} item(s) need review.`:`${did} ${actor.name}.`);
       const list=(title,arr)=>arr?.length?`<p><b>${title}</b></p><ul>${arr.map(w=>`<li>${esc(w)}</li>`).join("")}</ul>`:"";
-      if(updating) await foundry.applications.api.DialogV2.prompt({window:{title:"Update Summary"},content:`<div>${list("Class levels",summary?.levels)}${list(`Added (${summary?.added?.length||0})`,summary?.added)}${list("Quantities changed",summary?.qty)}${list("Still on the sheet but no longer in the export (left as they are)",summary?.notInExport)}${list("Needs attention",followUp)}${!summary?.levels?.length&&!summary?.added?.length&&!summary?.qty?.length?"<p>Nothing new was found in this export.</p>":""}${backup?`<p class="muted">A backup copy was saved as <b>${esc(backup.name)}</b>. Delete it once you are happy with the update.</p>`:""}</div>`,ok:{label:"Done"}});
+      if(updating) await foundry.applications.api.DialogV2.prompt({window:{title:"Update Summary"},content:`<div class="cbi-dialog">${list("Class levels",summary?.levels)}${list(`Added (${summary?.added?.length||0})`,summary?.added)}${list("Quantities changed",summary?.qty)}${list("Still on the sheet but no longer in the export (left as they are)",summary?.notInExport)}${list("Needs attention",followUp)}${!summary?.levels?.length&&!summary?.added?.length&&!summary?.qty?.length?"<p>Nothing new was found in this export.</p>":""}${backup?`<p class="muted">A backup copy was saved as <b>${esc(backup.name)}</b>. Delete it once you are happy with the update.</p>`:""}</div>`,ok:{label:"Done"}});
       else if(followUp.length) await foundry.applications.api.DialogV2.prompt({window:{title:"Import Review"},content:`<div><p>The actor was created. These items still need attention on the sheet:</p><ul>${followUp.map(w=>`<li>${esc(w)}</li>`).join("")}</ul><p>Everything else chosen in the wizard was applied.</p></div>`,ok:{label:"Done"}});
       this.close();
     }catch(err){
@@ -2060,6 +2181,9 @@ function canImport(){ return game.user?.isGM||game.user?.can?.("ACTOR_CREATE"); 
 async function openImporter(){
   if(game.system.id!=="dnd5e") return ui.notifications.error("D&D Friends Character Importer requires the dnd5e system.");
   if(!canImport()) return ui.notifications.warn("You need permission to create actors to use the importer.");
+  // Clicking the button again returns to the import in progress instead of opening a second window.
+  const open=foundry.applications.instances?.get?.(MODULE_ID);
+  if(open?.rendered){ open.bringToFront?.(); return; }
   const app=new ImportWizard(); await app.render({force:true});
   // Index in the background while the user picks a file; the file handler waits for the same load.
   if(!resolver.loaded){ app.setBusy("Indexing compendiums and world items…"); const msg="Indexing compendiums and world items…"; resolver.load().catch(e=>console.error(e)).finally(()=>{ if(app.busy===msg&&!app.data){ app.setBusy(""); if(app.rendered) app.render(); } }); }
@@ -2075,8 +2199,7 @@ Hooks.once("init",()=>{
 Hooks.once("ready",()=>{
   try{ game.socket?.on(SOCKET,msg=>{ if(msg?.type==="itemMatches") itemMemory.merge(msg.rec).catch(e=>console.warn(e)); }); }catch(e){ console.warn(`${MODULE_ID} | socket unavailable`,e); }
   itemMemory.collectFromUsers().catch(e=>console.warn(`${MODULE_ID} | could not collect item matches`,e));
-});
-Hooks.once("ready",()=>{ const mod=game.modules.get(MODULE_ID); if(mod) mod.api={openImporter,parseBotExport,plutoniumBridge,copyDiagnostics,diagnosticsReport,openRoll20Export,itemMemory,openItemMemory:()=>new ItemMemoryApp().render({force:true}),diagnostics:async()=>{ if(!resolver.loaded) await resolver.load(); const api=game.modules.get("plutonium")?.api||{};return {plutonium:{active:plutoniumBridge.detect(),version:plutoniumBridge.version,apiKeys:Object.keys(api),importerKeys:Object.keys(api.importer||{})},resolverEntries:resolver.entries.length,rawPlutoniumFeats:plutoniumBridge.rawFeats.length,remoteUa:plutoniumBridge.remoteUa,plutoniumSources:resolver.plutoniumSources(),rawFeatSources:plutoniumBridge.rawFeatSources(),rawItems:plutoniumBridge.rawItems.length,rawItemLoader:plutoniumBridge.itemLoadInfo||"none",plutoniumItemConverter:plutoniumBridge.itemConverters().length>0,enabledPlutoniumSources:[...(resolver.enabledPlutoniumSources||[])],originChoicePreview:resolver.entries.filter(e=>resolver.allowed(e)).filter(isOriginStyleChoice).map(e=>({name:e.name,subtype:e.featSubtype,page:e.plutonium?.page||"",source:e.plutonium?.source||e.source?.book||"",uuid:e.uuid})).slice(0,100)};}}; });
+  const mod=game.modules.get(MODULE_ID); if(mod) mod.api={openImporter,parseBotExport,plutoniumBridge,copyDiagnostics,diagnosticsReport,openRoll20Export,itemMemory,openItemMemory:()=>new ItemMemoryApp().render({force:true}),diagnostics:async()=>{ if(!resolver.loaded) await resolver.load(); const api=game.modules.get("plutonium")?.api||{};return {plutonium:{active:plutoniumBridge.detect(),version:plutoniumBridge.version,apiKeys:Object.keys(api),importerKeys:Object.keys(api.importer||{})},resolverEntries:resolver.entries.length,rawPlutoniumFeats:plutoniumBridge.rawFeats.length,remoteUa:plutoniumBridge.remoteUa,plutoniumSources:resolver.plutoniumSources(),rawFeatSources:plutoniumBridge.rawFeatSources(),rawItems:plutoniumBridge.rawItems.length,rawItemLoader:plutoniumBridge.itemLoadInfo||"none",plutoniumItemConverter:plutoniumBridge.itemConverters().length>0,enabledPlutoniumSources:[...(resolver.enabledPlutoniumSources||[])],originChoicePreview:resolver.entries.filter(e=>resolver.allowed(e)).filter(isOriginStyleChoice).map(e=>({name:e.name,subtype:e.featSubtype,page:e.plutonium?.page||"",source:e.plutonium?.source||e.source?.book||"",uuid:e.uuid})).slice(0,100)};}}; });
 Hooks.on("renderActorDirectory",(app,html)=>{
   if(!canImport()) return;
   const root=html instanceof HTMLElement?html:html?.[0]; if(!root||root.querySelector(".cbi-open"))return;
@@ -2099,3 +2222,5 @@ Hooks.on("getActorContextOptions",(app,options)=>{
 });
 
 export { openImporter, parseBotExport, ImportWizard, openRoll20Export, copyDiagnostics };
+/** Pure helpers, exported for tests/ only. */
+export const __test = { PythonLiteralParser, parseBotExport, normalizeBotExport, acquisitionQty, consumableQty, applyStatBonus, baseStats, effectiveStats, defaultClassOrder, averageHp, norm, esc, canonicalFeatName, speciesLineage, maxSpellLevelForProgression, advancementList, advancementData, advancementEntries, advTitle, itemChoiceCount, parseTraitGrant, fromPairs, resolver, ImportWizard };

@@ -1,0 +1,12 @@
+{
+  "name": "dnd-friends-character-importer",
+  "private": true,
+  "type": "module",
+  "description": "Development tooling only. Foundry reads module.json; nothing here ships in module.zip.",
+  "scripts": {
+    "test": "node --check scripts/importer.js && node --test tests/pure.test.mjs && node tests/wizard.smoke.mjs"
+  },
+  "devDependencies": {
+    "jsdom": "^31.0.0"
+  }
+}
