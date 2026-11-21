@@ -305,9 +305,33 @@ class ContentResolver {
     const n=norm(name); const rows=this.entries.filter(e=>this.allowed(e)&&String(e.rawType||"").toLowerCase()==="class"&&e.n===n).sort((a,b)=>this.priority(b)-this.priority(a));
     return rows[0]?{...rows[0],type:"class",score:1}:null;
   }
+  /** Does an indexed subclass belong to this class? Subclasses without a parent class are allowed for every class. */
+  subclassFits(e,classIdentifier=""){ const id=norm(classIdentifier); return !id||!e.classIdentifier||norm(e.classIdentifier)===id; }
   bestSubclass(name,classIdentifier=""){
-    const cs=this.candidates(name,["subclass"]); const id=norm(classIdentifier); if(!id) return cs[0]||null;
-    return cs.find(e=>norm(e.classIdentifier)===id)||cs.find(e=>!e.classIdentifier)||null;
+    const cs=this.candidates(name,["subclass"]); const id=norm(classIdentifier);
+    const hit=!id?cs[0]:(cs.find(e=>norm(e.classIdentifier)===id)||cs.find(e=>!e.classIdentifier));
+    if(hit) return hit;
+    // No 2024 version: fall back to an older one (2014 PHB, Xanathar's…) so the character still gets its subclass.
+    // The overview flags it, because 2014 subclass features can arrive at different levels.
+    const old=this.scored(this.excludedEntries.filter(e=>this.allowed(e)&&this.subclassFits(e,classIdentifier)),norm(name),["subclass"])
+      .sort((a,b)=>(b.score-a.score)||(this.priority(b)-this.priority(a)))[0];
+    return old?{...old,legacy:true}:null;
+  }
+  /** Every subclass of a class the importer can see, 2024 first, best match to `name` first; for the Character step's picker. */
+  subclassOptions(classIdentifier="",name=""){
+    const n=norm(name), seen=new Set(), out=[];
+    const rows=[...this.entries.filter(e=>this.allowed(e)).map(e=>({...e,legacy:false})),...this.excludedEntries.filter(e=>this.allowed(e)).map(e=>({...e,legacy:true}))]
+      .filter(e=>e.type==="subclass"&&this.subclassFits(e,classIdentifier))
+      .map(e=>({...e,score:n?this.score(n,e.n??norm(e.name),"subclass"):0}))
+      .sort((a,b)=>(b.score-a.score)||((a.legacy?1:0)-(b.legacy?1:0))||(this.priority(b)-this.priority(a))||String(a.name).localeCompare(String(b.name)));
+    for(const e of rows){ if(seen.has(e.uuid)) continue; seen.add(e.uuid); out.push(e); }
+    return out;
+  }
+  /** Every indexed subclass-like row for a class, kept or set aside, for Copy diagnostics. */
+  subclassIndexReport(classIdentifier=""){
+    const row=(e,kept)=>`${e.name} [${e.rawType||e.type}${e.type!==e.rawType?`→${e.type}`:""}] class=${e.classIdentifier||"-"} rules=${e.source?.rules||"-"} book=${e.source?.book||"-"} ${kept?"2024":"set aside as 2014"}${this.allowed(e)?"":" (source switched off)"} · ${e.packTitle||e.location||""}`;
+    const fits=e=>(e.type==="subclass"||e.rawType==="subclass")&&this.subclassFits(e,classIdentifier);
+    return [...this.entries.filter(fits).map(e=>row(e,true)),...this.excludedEntries.filter(fits).map(e=>row(e,false))];
   }
 }
 
@@ -1067,7 +1091,14 @@ async function diagnosticsReport(app=null){
     const d=app.data;
     L.push("",`Character: ${d.Name} · level ${d.Level} · ${d.Race} · ${Object.entries(d.Class||{}).map(([k,v])=>`${k} ${v.Level}${v.Subclass?` (${v.Subclass})`:""}`).join(" / ")}`);
     L.push(`File: ${app.fileName} · Mode: ${app.targetActorId?`update "${game.actors?.get(app.targetActorId)?.name||app.targetActorId}"`:"new character"}${app.savedFrom?" · saved choices restored":""}`);
-    for(const x of app.coreDocs||[]) L.push(`  ${x.kind}: ${x.name} → ${x.doc?.name||"?"} [${x.uuid}]`);
+    for(const x of app.coreDocs||[]) L.push(`  ${x.kind}: ${x.name} → ${x.doc?.name||"?"}${x.legacy?" (2014)":""}${x.picked?" (picked)":""} [${x.uuid}]`);
+    // Every subclass the index holds for each class, so a "not found" can be explained from one paste.
+    for(const [cn,c] of Object.entries(d.Class||{})){
+      if(!c.Subclass) continue; const cls=(app.coreDocs||[]).find(x=>x.kind==="class"&&x.name===cn); const cid=cls?.doc?.system?.identifier||norm(cn).replace(/ /g,"-");
+      const rows=resolver.subclassIndexReport(cid);
+      L.push(`Subclasses indexed for ${cn} (identifier "${cid}"): ${rows.length}`); for(const r of rows.slice(0,40)) L.push(`  - ${r}`); if(rows.length>40) L.push(`  … ${rows.length-40} more`);
+      if(!app.coreDocs?.some(x=>x.kind==="subclass"&&x.className===cn)) L.push(`  "${c.Subclass}": ${resolver.diagnostic(c.Subclass,["subclass"])}`);
+    }
     try{ const st=app.importStatus(); for(const [label,list] of [["Must choose",st.block],["Worth a look",st.warn]]) if(list.length){ L.push(`${label}:`); for(const r of list) L.push(`  - ${r.text}`); } }
     catch(e){ L.push(`(could not build the import status: ${e.message})`); }
   }
@@ -1168,7 +1199,7 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
     this.step=0; this.data=null; this.fileName=""; this.skills=[]; this.classOrder=[]; this.hpOverride=""; this.matches=new Map(); this.spells=new Set();
     this.equipment=new Map(); this.warnings=[]; this.advChoiceDefs=[]; this.advChoices=new Map(); this.coreDocs=[]; this.featDocs=[]; this.magicInitiateList="wizard";
     this.advSearch=new Map(); this.casterProfiles=new Map(); this.spellClassAssignments=new Map(); this.speciesUuid=null; this.featurePlacementDefs=[];
-    this.featurePlacements=new Map(); this.choicePlacements=new Map(); this.grantedSpells=new Map(); this.resilientSave=""; this.ownerId="";
+    this.featurePlacements=new Map(); this.choicePlacements=new Map(); this.grantedSpells=new Map(); this.resilientSave=""; this.ownerId=""; this.subclassPicks=new Map();
     this.finalTraits={dr:new Set(),di:new Set(),dv:new Set(),ci:new Set(),languages:new Set(),tools:new Set(),senses:{darkvision:"",blindsight:"",tremorsense:"",truesight:""}};
     this.traitsSignature=null; this.spellLevelFilter="all"; this._low=new Set(); this.confirmed=new Set();
     this.remembered=new Set(); this.savedFrom=null; this._pendingSpells=null; this.targetActorId=""; this.sourceText="";
@@ -1298,7 +1329,14 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
       for(const [cn,c] of Object.entries(this.data.Class||{})){
         const m=resolver.bestClass(cn); let classDoc=null;
         if(m){classDoc=await getDoc(m.uuid);if(classDoc)this.coreDocs.push({kind:"class",name:cn,doc:classDoc,uuid:m.uuid,level:Number(c.Level||1),isPrimary:norm(cn)===first});}
-        if(c.Subclass){const sm=resolver.bestSubclass(c.Subclass,classDoc?.system?.identifier||norm(cn).replace(/ /g,"-"));if(sm){const sd=await getDoc(sm.uuid);if(sd)this.coreDocs.push({kind:"subclass",name:c.Subclass,className:cn,doc:sd,uuid:sm.uuid,level:Number(c.Level||1),isPrimary:norm(cn)===first});}}
+        if(c.Subclass){
+          const cid=classDoc?.system?.identifier||norm(cn).replace(/ /g,"-");
+          // A subclass picked on the Character step wins; "" means "no subclass" was picked on purpose.
+          const pick=this.subclassPicks.get(cn); let sm=null, picked=false;
+          if(pick!==undefined){ picked=true; sm=pick?resolver.getAny(pick):null; if(pick&&!sm) picked=false; }
+          if(!picked) sm=resolver.bestSubclass(c.Subclass,cid);
+          if(sm){const sd=await getDoc(sm.uuid);if(sd)this.coreDocs.push({kind:"subclass",name:c.Subclass,className:cn,doc:sd,uuid:sm.uuid,level:Number(c.Level||1),isPrimary:norm(cn)===first,legacy:!!(sm.legacy||resolver.excludedByUuid.has(sm.uuid)),picked});}
+        }
       }
       this.ensureCasterProfiles();
       this.setBusy("Loading feat and spell data…");
@@ -1456,7 +1494,7 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
       featMatches:[...this.matches].filter(([k])=>k.startsWith("feat:")), equipment,
       spells:[...this.spells], spellClassAssignments:[...this.spellClassAssignments], advChoices:[...this.advChoices],
       magicInitiateList:this.magicInitiateList, casterProfiles:[...this.casterProfiles].map(([k,p])=>[k,{progression:p.progression,ability:p.ability,maxOverride:p.maxOverride??""}]),
-      speciesUuid:this.speciesUuid||"", featurePlacements:[...this.featurePlacements], choicePlacements:[...this.choicePlacements],
+      speciesUuid:this.speciesUuid||"", subclassPicks:[...this.subclassPicks], featurePlacements:[...this.featurePlacements], choicePlacements:[...this.choicePlacements],
       resilientSave:this.resilientSave||"", featBonusesInStats:!!this.data?.__featBonusesInStats,
       finalTraits:{dr:sets("dr"),di:sets("di"),dv:sets("dv"),ci:sets("ci"),languages:sets("languages"),tools:sets("tools"),senses:{...this.finalTraits.senses}},
       traitEdits:this.traitEdits() };
@@ -1478,6 +1516,7 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
     for(const [k,v] of fromPairs(saved.featMatches)) if(feats.has(k)&&v){ this.matches.set(k,v); this.confirmed.add(k); }
     if(saved.featBonusesInStats) Object.defineProperty(this.data,"__featBonusesInStats",{value:true,enumerable:false,writable:true,configurable:true});
     if(saved.speciesUuid) this.speciesUuid=saved.speciesUuid;
+    for(const [cn,u] of Array.isArray(saved.subclassPicks)?saved.subclassPicks:[]) if(this.data.Class?.[cn]) this.subclassPicks.set(cn,u);
     if(saved.magicInitiateList) this.magicInitiateList=saved.magicInitiateList;
     if(saved.resilientSave) this.resilientSave=saved.resilientSave;
     for(const [k,v] of fromPairs(saved.advChoices)) if(Array.isArray(v)&&v.length) this.advChoices.set(k,[...v]);
@@ -1539,7 +1578,11 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
     if(species) go(done,`Species: ${species.doc?.name||species.name}`,1); else go(warn,`Species “${normalizeSpeciesName(this.data.Race)}” not found`,1);
     for(const [cn,c] of Object.entries(this.data.Class||{})){
       const cls=this.coreDocs.find(x=>x.kind==="class"&&x.name===cn); if(cls) go(done,`${cn} ${c.Level}`,1); else go(warn,`Class “${cn}” not found`,1);
-      if(c.Subclass){ const sub=this.coreDocs.find(x=>x.kind==="subclass"&&x.name===c.Subclass); if(sub) go(done,`Subclass: ${sub.doc?.name||c.Subclass}`,1); else go(warn,`Subclass “${c.Subclass}” not found`,1); }
+      if(c.Subclass){ const sub=this.coreDocs.find(x=>x.kind==="subclass"&&x.className===cn)||this.coreDocs.find(x=>x.kind==="subclass"&&x.name===c.Subclass);
+        if(sub&&sub.legacy&&!sub.picked) go(warn,`Subclass: only a 2014 version of “${c.Subclass}” was found (${sub.doc?.name||c.Subclass}). Its features may come at different levels; pick another on the Character step if you have one`,1);
+        else if(sub) go(done,`Subclass: ${sub.doc?.name||c.Subclass}${sub.legacy?" (2014)":""}`,1);
+        else if(this.subclassPicks.get(cn)==="") go(done,`${cn}: imported without a subclass, as chosen`,1);
+        else go(warn,`Subclass “${c.Subclass}” not found — ${resolver.diagnostic(c.Subclass,["subclass"])}. Pick it on the Character step if it is in a compendium under another name`,1); }
     }
     go(done,this.hpOverride?`HP fixed at ${this.hpOverride}`:`HP calculated by Foundry (about ${averageHp(this.data,this.classOrder.length?this.classOrder:undefined,null,this.hitDiceByClass())})`,1);
     // Choices
@@ -1595,7 +1638,13 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
     const matched=this.coreDocs.filter(x=>x.kind==="class"||x.kind==="subclass").map(x=>`<li><b>${esc(x.name)}</b> → ${esc(x.doc?.name||"?")}${x.kind==="subclass"?` <small>(${esc(x.className)} subclass)</small>`:""}</li>`).join("");
     const missing=Object.entries(this.data.Class||{}).flatMap(([cn,c])=>[...(this.coreDocs.some(x=>x.kind==="class"&&x.name===cn)?[]:[{name:cn,type:"class"}]),...(c.Subclass&&!this.coreDocs.some(x=>x.kind==="subclass"&&x.name===c.Subclass)?[{name:c.Subclass,type:"subclass"}]:[])]);
     const missingText=missing.map(x=>`${x.name} — ${resolver.diagnostic(x.name,[x.type])}`);
-    return `<section><h2>Character</h2><div class="grid6">${ABILITIES.map(a=>`<div class="stat"><label>${a.toUpperCase()}</label><strong>${base[a]}</strong>${eff[a]!==base[a]?`<small>${eff[a]} with items</small>`:""}</div>`).join("")}</div><p class="muted">${this.featBonusNote()}Magic items that change a score apply their own effect in Foundry; the bot's bonus is only added when an item becomes a placeholder.</p>${speciesOptions.length?`<h3>Species</h3><p class="muted">Size suffixes such as (Medium) are used for the species size choice. If multiple 2024 versions or legacies are available, choose the intended one.</p><select data-species-choice>${speciesOptions.map(e=>`<option value="${esc(e.uuid)}" ${selectedSpecies?.uuid===e.uuid?'selected':''}>${esc(e.name)} — ${esc(e.plutonium?.source||e.source?.book||'2024')}</option>`).join("")}</select>`:""}${matched||missing.length?`<h3>Class Matches</h3><ul class="match-list">${matched}</ul>${missing.length?`<div class="warning">${missingText.map(esc).join("<br>")}</div>`:""}`:""}<h3>Hit Points</h3><p>Foundry calculates maximum HP from each class's hit die (maximum at level 1, average after), Constitution, and features such as Tough or Dwarven Toughness. Enter a number only if this character's HP must be a fixed total.</p><div class="form-row"><label>Estimated HP</label><input value="${avg}" disabled><label>Fixed HP (optional)</label><input data-hp type="number" min="1" autocomplete="off" placeholder="Calculated" value="${esc(this.hpOverride)}"></div>${Object.keys(this.data.Class||{}).length>1?this.classOrderView():""}<div class="notice">2024 rules plus enabled UA/custom sources. No Background document will be imported.</div></section>`;
+    const subclassPickers=Object.entries(this.data.Class||{}).filter(([,c])=>c.Subclass).map(([cn,c])=>{
+      const cls=this.coreDocs.find(x=>x.kind==="class"&&x.name===cn); const cid=cls?.doc?.system?.identifier||norm(cn).replace(/ /g,"-");
+      const cur=this.coreDocs.find(x=>x.kind==="subclass"&&x.className===cn); const opts=resolver.subclassOptions(cid,c.Subclass).slice(0,60);
+      const label=e=>`${e.name} — ${e.source?.book||e.plutonium?.source||e.packTitle||"world"}${e.legacy?" (2014)":""}`;
+      return `<label class="subclass-pick"><span>${esc(cn)} subclass <small>(export says “${esc(c.Subclass)}”)</small></span><select data-subclass-choice="${esc(cn)}"><option value="" ${!cur?"selected":""}>${cur?"No subclass":opts.length?"Not matched: choose one":"None found in your compendiums"}</option>${opts.map(e=>`<option value="${esc(e.uuid)}" ${cur?.uuid===e.uuid?"selected":""}>${esc(label(e))}</option>`).join("")}</select></label>`;
+    }).join("");
+    return `<section><h2>Character</h2><div class="grid6">${ABILITIES.map(a=>`<div class="stat"><label>${a.toUpperCase()}</label><strong>${base[a]}</strong>${eff[a]!==base[a]?`<small>${eff[a]} with items</small>`:""}</div>`).join("")}</div><p class="muted">${this.featBonusNote()}Magic items that change a score apply their own effect in Foundry; the bot's bonus is only added when an item becomes a placeholder.</p>${speciesOptions.length?`<h3>Species</h3><p class="muted">Size suffixes such as (Medium) are used for the species size choice. If multiple 2024 versions or legacies are available, choose the intended one.</p><select data-species-choice>${speciesOptions.map(e=>`<option value="${esc(e.uuid)}" ${selectedSpecies?.uuid===e.uuid?'selected':''}>${esc(e.name)} — ${esc(e.plutonium?.source||e.source?.book||'2024')}</option>`).join("")}</select>`:""}${matched||missing.length?`<h3>Class Matches</h3><ul class="match-list">${matched}</ul>${missing.length?`<div class="warning">${missingText.map(esc).join("<br>")}</div>`:""}`:""}${subclassPickers?`<div class="subclass-picks">${subclassPickers}</div>`:""}<h3>Hit Points</h3><p>Foundry calculates maximum HP from each class's hit die (maximum at level 1, average after), Constitution, and features such as Tough or Dwarven Toughness. Enter a number only if this character's HP must be a fixed total.</p><div class="form-row"><label>Estimated HP</label><input value="${avg}" disabled><label>Fixed HP (optional)</label><input data-hp type="number" min="1" autocomplete="off" placeholder="Calculated" value="${esc(this.hpOverride)}"></div>${Object.keys(this.data.Class||{}).length>1?this.classOrderView():""}<div class="notice">2024 rules plus enabled UA/custom sources. No Background document will be imported.</div></section>`;
   }
   featBonusNote(){
     const fb=this.data?.__featStatBonuses||[]; if(!fb.length) return "Base scores are imported as-is. ";
@@ -1827,6 +1876,7 @@ class ImportWizard extends foundry.applications.api.ApplicationV2 {
     root.querySelector("[data-feat-bonuses-included]")?.addEventListener("change",async e=>{ Object.defineProperty(this.data,"__featBonusesInStats",{value:e.target.checked,enumerable:false,writable:true,configurable:true}); await this.rerender(); });
     root.querySelector("[data-start-class]")?.addEventListener("change",async e=>{ this.classOrder=this.orderStartingWith(e.target.value); await this.prepareCharacterMetadata(); await this.rerender(); });
     root.querySelector("[data-species-choice]")?.addEventListener("change",async e=>{this.speciesUuid=e.target.value;await this.prepareCharacterMetadata();await this.rerender();});
+    root.querySelectorAll("[data-subclass-choice]").forEach(sel=>sel.addEventListener("change",async e=>{ if(this.busy) return; this.subclassPicks.set(e.target.dataset.subclassChoice,e.target.value); await this.prepareCharacterMetadata(); await this.rerender(); }));
     root.querySelectorAll("[data-feature-placement]").forEach(x=>x.addEventListener("change",e=>this.featurePlacements.set(e.target.dataset.featurePlacement,e.target.value)));
     root.querySelectorAll("[data-choice-placement]").forEach(x=>x.addEventListener("change",e=>this.choicePlacements.set(e.target.dataset.choicePlacement,e.target.value)));
     root.querySelector("[data-resilient-save]")?.addEventListener("change",e=>this.resilientSave=e.target.value);
@@ -2223,4 +2273,4 @@ Hooks.on("getActorContextOptions",(app,options)=>{
 
 export { openImporter, parseBotExport, ImportWizard, openRoll20Export, copyDiagnostics };
 /** Pure helpers, exported for tests/ only. */
-export const __test = { PythonLiteralParser, parseBotExport, normalizeBotExport, acquisitionQty, consumableQty, applyStatBonus, baseStats, effectiveStats, defaultClassOrder, averageHp, norm, esc, canonicalFeatName, speciesLineage, maxSpellLevelForProgression, advancementList, advancementData, advancementEntries, advTitle, itemChoiceCount, parseTraitGrant, fromPairs, resolver, ImportWizard };
+export const __test = { diagnosticsReport, PythonLiteralParser, parseBotExport, normalizeBotExport, acquisitionQty, consumableQty, applyStatBonus, baseStats, effectiveStats, defaultClassOrder, averageHp, norm, esc, canonicalFeatName, speciesLineage, maxSpellLevelForProgression, advancementList, advancementData, advancementEntries, advTitle, itemChoiceCount, parseTraitGrant, fromPairs, resolver, ImportWizard };
