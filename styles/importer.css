@@ -93,3 +93,9 @@
 .theme-light .cbi{background:none}
 .theme-light .cbi .stat small{color:#7a5c12}
 .theme-light .cbi-steps div[data-goto-step]:hover,.theme-light .cbi-steps div[data-goto-step]:focus-visible{background:rgba(0,0,0,.05)}
+
+/* v0.21.1 subclass picker */
+.cbi .subclass-picks{display:grid;gap:.5rem;margin:.4rem 0 .8rem}
+.cbi .subclass-pick{display:grid;grid-template-columns:minmax(180px,1fr) minmax(260px,2fr);gap:.6rem;align-items:center}
+.cbi .subclass-pick small{opacity:.7;font-weight:400}
+@media(max-width:760px){.cbi .subclass-pick{grid-template-columns:1fr}}
