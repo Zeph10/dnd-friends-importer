@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.21.1
+
+Subclasses
+- **A subclass picker on the Character step.** Each class with a subclass gets a dropdown listing every subclass of that class the importer can see in your compendiums and world items (2024 versions first, then 2014). The export's short names ("Light", "Zealot") are matched automatically when possible; when they are not, pick the right one there. The pick is saved on the character and used again on the next import.
+- **2014 fallback.** When only a 2014 version of a subclass exists (for example Path of the Zealot from Xanathar's), it is used instead of nothing and flagged under "Worth a look", because 2014 subclass features can arrive at different levels. Picking it on purpose clears the flag.
+- **Reasons, not just "not found".** The overview now says why a subclass was not matched (not indexed, set aside as 2014, source switched off, stored under another type).
+- **Copy diagnostics** lists every subclass indexed for each of the character's classes, with its type, parent class, rules, book and compendium, so a missing subclass can be tracked down from one paste.
+
 ## v0.21.0
 
 dnd5e 6.0
