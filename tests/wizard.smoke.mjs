@@ -66,6 +66,15 @@ const item = (n, name, type, tv) => mkDoc(U(n), { name, type, system: { source: 
 item("longsword", "Longsword", "weapon", "martialM"); item("chain-mail", "Chain Mail", "equipment", "heavy"); item("potion", "Potion of Healing", "consumable", "potion");
 item("ring.one", "St. Elmo's Ring", "equipment", "ring");
 
+// DDB Importer-shaped content for the subclass tests: a 2024 Light Domain, a Zealot that only exists as a 2014 version,
+// and a decoy subclass of another class with a similar name.
+const D = n => `Compendium.world.ddb-subclasses.Item.${n}`;
+mkDoc(U("cleric"), { name: "Cleric", type: "class", system: { source: src, identifier: "cleric", levels: 1, hd: { denomination: "d8" }, spellcasting: { progression: "full", ability: "wis" }, advancement: [hp("chp")] } });
+mkDoc(U("barbarian"), { name: "Barbarian", type: "class", system: { source: src, identifier: "barbarian", levels: 1, hd: { denomination: "d12" }, spellcasting: { progression: "none" }, advancement: [hp("bhp")] } });
+mkDoc(D("light"), { name: "Light Domain", type: "subclass", system: { source: { rules: "2024", book: "PHB 2024" }, identifier: "light-domain", classIdentifier: "cleric", advancement: [] } });
+mkDoc(D("life"), { name: "Life Domain", type: "subclass", system: { source: { rules: "2024", book: "PHB 2024" }, identifier: "life-domain", classIdentifier: "cleric", advancement: [] } });
+mkDoc(D("zealot14"), { name: "Path of the Zealot", type: "subclass", system: { source: { rules: "2014", book: "XGE" }, identifier: "path-of-the-zealot", classIdentifier: "barbarian", advancement: [] } });
+mkDoc(D("twilight"), { name: "Circle of Twilight", type: "subclass", system: { source: { rules: "2024", book: "UA" }, identifier: "twilight", classIdentifier: "druid", advancement: [] } });
 const indexRows = [...docs.values()].map(d => ({ _id: d._id, uuid: d.uuid, name: d.name, type: d.type, system: d.toObject().system, flags: {} }));
 class FakeItem { constructor(data, parent) { Object.assign(this, clone(data)); this.id = this._id = randomID(); this.parent = parent; this.uuid = `Actor.${parent.id}.Item.${this.id}`; this.system.advancement = Array.isArray(this.system.advancement) ? this.system.advancement : this.system.advancement || {}; }
   toObject() { const { parent, ...rest } = this; return clone(rest); } }
@@ -180,3 +189,33 @@ for (const [label, text, re] of [["empty file", "  ", /empty/], ["not an export"
   let msg = ""; try { parseBotExport(text); } catch (e) { msg = e.message; } ok(re.test(msg), `${label}: "${msg}"`); }
 const app4 = new ImportWizard(); await app4.render(); let threw = ""; try { await app4.loadExport("{'Name':'x','Class':{}}", "x.txt"); } catch (e) { threw = e.message; }
 ok(/no Class section/.test(threw) && app4.data === null, "export without classes rejected and nothing left loaded");
+
+// ---------- subclasses: short export names, 2014 fallback, picker, reasons ----------
+{
+  const SUB = "{'Name': 'Sub Test', 'Level': 10, 'Race': 'Human', 'Stats': {'STR': 10, 'DEX': 10, 'CON': 10, 'INT': 10, 'WIS': 10, 'CHA': 10}," +
+    " 'Class': {'Cleric': {'Level': 5, 'Subclass': 'Light'}, 'Barbarian': {'Level': 3, 'Subclass': 'Zealot'}, 'Wizard': {'Level': 2, 'Subclass': 'Moonbeam'}}}";
+  await resolver.load(true);
+  const w = new ImportWizard(); await w.render(); await w.loadExport(SUB, "sub.txt");
+  const subOf = cn => w.coreDocs.find(x => x.kind === "subclass" && x.className === cn);
+  ok(subOf("Cleric")?.doc?.name === "Light Domain" && !subOf("Cleric").legacy, "“Light” matches the 2024 Light Domain of the Cleric, not Circle of Twilight");
+  ok(subOf("Barbarian")?.doc?.name === "Path of the Zealot" && subOf("Barbarian").legacy, "“Zealot” falls back to the 2014 Path of the Zealot when no 2024 version exists");
+  const s1 = w.importStatus(); const warn = s1.warn.map(r => r.text);
+  ok(warn.some(t => /only a 2014 version of “Zealot”/.test(t)), "2014 fallback is flagged on the overview: " + warn.filter(t => /Zealot/.test(t)));
+  ok(warn.some(t => /Subclass “Moonbeam” not found — not indexed/.test(t)), "a missing subclass says why: " + warn.filter(t => /Moonbeam/.test(t)));
+  w.step = 1; await w.render();
+  const sel = w.element.querySelector('[data-subclass-choice="Cleric"]');
+  const opts = sel ? [...sel.options].map(o => o.textContent) : [];
+  ok(sel && opts.some(t => /Life Domain/.test(t)) && !opts.some(t => /Twilight/.test(t)), "Character step has a Cleric subclass picker with only Cleric subclasses: " + opts.join(" | "));
+  ok([...w.element.querySelector('[data-subclass-choice="Wizard"]').options].some(o => /Evoker/.test(o.textContent)), "an unmatched subclass can still be picked from the class's list");
+  sel.value = D("life"); sel.dispatchEvent(new window.Event("change")); await new Promise(r => setTimeout(r, 20));
+  ok(subOf("Cleric")?.doc?.name === "Life Domain" && subOf("Cleric").picked, "picking another subclass replaces the match");
+  const wz = w.element.querySelector('[data-subclass-choice="Wizard"]'); wz.value = U("evoker"); wz.dispatchEvent(new window.Event("change")); await new Promise(r => setTimeout(r, 20));
+  ok(subOf("Wizard")?.doc?.name === "Evoker" && !w.importStatus().warn.some(r => /Moonbeam/.test(r.text)), "picking a subclass for an unmatched one clears the warning");
+  const zb = w.element.querySelector('[data-subclass-choice="Barbarian"]'); zb.value = D("zealot14"); zb.dispatchEvent(new window.Event("change")); await new Promise(r => setTimeout(r, 20));
+  ok(!w.importStatus().warn.some(r => /2014 version/.test(r.text)), "a 2014 subclass picked on purpose is not flagged again");
+  const snap = w.snapshotChoices(); ok(JSON.stringify(snap.subclassPicks) === JSON.stringify([["Cleric", D("life")], ["Wizard", U("evoker")], ["Barbarian", D("zealot14")]]), "subclass picks saved: " + JSON.stringify(snap.subclassPicks));
+  const w2 = new ImportWizard(); await w2.render(); w2.data = parseBotExport(SUB); w2.applySavedChoices(snap); await w2.prepareCharacterMetadata();
+  ok(w2.coreDocs.find(x => x.kind === "subclass" && x.className === "Cleric")?.doc?.name === "Life Domain", "subclass pick restored on the next import");
+  const diag = await __test.diagnosticsReport(w);
+  ok(/Subclasses indexed for Cleric \(identifier "cleric"\): 2/.test(diag) && /Light Domain \[subclass\] class=cleric rules=2024/.test(diag), "Copy diagnostics lists the subclasses indexed for each class");
+}
